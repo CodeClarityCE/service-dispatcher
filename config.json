@@ -1,0 +1,7 @@
+{
+    "name": "dispatcher",
+    "version": "v0.0.2",
+    "image_name": "ceherzog/service-dispatcher",
+    "image_version": "0.0.2",
+    "depends_on": []
+}
