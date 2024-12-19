@@ -48,7 +48,7 @@ pipeline {
                 // sh 'make push'
                 sh 'docker buildx rm plugin || true'
                 sh 'docker buildx create --name plugin --use --bootstrap'
-                sh 'docker buildx build -f .cloud/docker/Dockerfile --platform linux/amd64,linux/arm64 --target plugin --tag ceherzog/service-dispatcher:latest --tag $Tag --push .'
+                sh 'docker buildx build -f .cloud/docker/Dockerfile --platform linux/amd64,linux/arm64 --target plugin --tag codeclarityce/service-dispatcher:latest --tag $Tag --push .'
             }
         }
     }

@@ -4,7 +4,7 @@
 
 KIND = service
 NAME = dispatcher
-REPOSITORY = ceherzog/$(KIND)-$(NAME)
+REPOSITORY = codeclarityce/$(KIND)-$(NAME)
 
 ## —— 🦉 CodeClarity's plugin Makefile 🦉 ——————————————————————————————————
 help: ## Outputs this help screen
