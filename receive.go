@@ -206,9 +206,9 @@ func dispatch(connection string, d amqp.Delivery) {
 			for step_id, step := range analysis_document.Steps[0] {
 				// Start plugin by sending message to dispatcher_plugin
 				dispatcherMessage := types_amqp.DispatcherPluginMessage{
-					AnalysisId: analysis_document.Id,
-					ProjectId:  apiMessage.ProjectId,
-					Data:       apiMessage.Config,
+					AnalysisId:     analysis_document.Id,
+					OrganizationId: apiMessage.OrganizationId,
+					Data:           apiMessage.Config,
 				}
 				data, _ := json.Marshal(dispatcherMessage)
 				analysis_document.Steps[0][step_id].Status = codeclarity.STARTED
@@ -249,8 +249,8 @@ func dispatch(connection string, d amqp.Delivery) {
 		for step_id, step := range analysis_document.Steps[0] {
 			// Start plugin by sending message to dispatcher_plugin
 			dispatcherMessage := types_amqp.DispatcherPluginMessage{
-				AnalysisId: analysis_document.Id,
-				ProjectId:  apiMessage.ProjectId,
+				AnalysisId:     analysis_document.Id,
+				OrganizationId: apiMessage.OrganizationId,
 			}
 			data, _ := json.Marshal(dispatcherMessage)
 			analysis_document.Steps[0][step_id].Status = codeclarity.STARTED
