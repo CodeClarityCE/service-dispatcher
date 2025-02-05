@@ -332,6 +332,18 @@ func dispatch(connection string, d amqp.Delivery) {
 		}
 		// If stage completed, go to next stage
 		if stage_completed {
+			analyzer_document := &codeclarity.Analyzer{
+				Id: analysis_document.AnalyzerId,
+			}
+			err = db.NewSelect().Model(analyzer_document).WherePK().Scan(ctx)
+			if err != nil {
+				panic(err)
+			}
+			organization_uuid, err := uuid.Parse(analyzer_document.OrganizationId)
+			if err != nil {
+				panic(err)
+			}
+
 			// Increment stage
 			analysis_document.Stage++
 			if analysis_document.Stage == len(analysis_document.Steps) {
@@ -346,7 +358,8 @@ func dispatch(connection string, d amqp.Delivery) {
 				for step_id, step := range analysis_document.Steps[analysis_document.Stage] {
 					// Start plugin by sending message to dispatcher_plugin
 					dispatcherMessage := types_amqp.DispatcherPluginMessage{
-						AnalysisId: pluginMessage.AnalysisId,
+						AnalysisId:     pluginMessage.AnalysisId,
+						OrganizationId: organization_uuid,
 					}
 					data, _ := json.Marshal(dispatcherMessage)
 					send("dispatcher_"+step.Name, data)
