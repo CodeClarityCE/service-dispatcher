@@ -2,6 +2,8 @@ github.com/CodeClarityCE/utility-types v0.0.0-alpha h1:C04cjUNqZWJH0ZOTwP5MvDbG2
 github.com/CodeClarityCE/utility-types v0.0.0-alpha/go.mod h1:4X9vlmIl0N3I0eLvcbtXD99+EQT9XMZSLDVrNzRi3cI=
 github.com/CodeClarityCE/utility-types v0.0.1-alpha h1:xqDo+JeJ/RcF7jHpZOiHUBa+u4j5WB45D6LOsMTmzg8=
 github.com/CodeClarityCE/utility-types v0.0.1-alpha/go.mod h1:4X9vlmIl0N3I0eLvcbtXD99+EQT9XMZSLDVrNzRi3cI=
+github.com/CodeClarityCE/utility-types v0.0.2-alpha h1:umW1lrqDfXnDYn3pFaOULVwYiXZTpxjBgkAXD2CjF78=
+github.com/CodeClarityCE/utility-types v0.0.2-alpha/go.mod h1:U3MB3ikw7xpwSUv/rPRZ+D16xGImgq6XjnEVuoqd1ao=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/go-logr/logr v1.2.2/go.mod h1:jdQByPbusPIv2/zmleS9BjJVeZ6kBagPoEUsqbVz/1A=
