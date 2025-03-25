@@ -5,7 +5,7 @@ go 1.23.0
 toolchain go1.24.1
 
 require (
-	github.com/CodeClarityCE/utility-types v0.0.3-alpha
+	github.com/CodeClarityCE/utility-types v0.0.4-alpha
 	github.com/google/uuid v1.6.0
 	github.com/rabbitmq/amqp091-go v1.10.0
 	github.com/uptrace/bun v1.2.11
