@@ -1,6 +1,4 @@
 pipeline {
-    // Run on an agent where we want to use Go
-    // agent { docker { image 'golang:1.20-alpine' } }
     agent { label 'codeclarity' }
 
     environment {
@@ -25,7 +23,6 @@ pipeline {
                     sh 'echo $Version'
                     env.Tag = "${Name}:${Version.substring(1)}"
                     sh 'echo $Tag'
-                    sh "sh .cloud/jenkins/check_version.sh ${Version}"
                     withCredentials(
                         [
                             file(credentialsId: 'netrc', variable: 'netrc'),
@@ -34,21 +31,19 @@ pipeline {
                         writeFile file: '.cloud/docker/config/.netrc', text: readFile(netrc)
                     }
                 }
+                sh 'docker buildx build -f .cloud/docker/Dockerfile --platform linux/amd64 --target plugin --tag codeclarityce/service-dispatcher:latest --tag $Tag .'
             }
         }
-        // stage('Test') {
-        //     steps {
-        //         // Output will be something like "go version go1.19 darwin/arm64"
-        //         sh 'make'
-        //     }
-        // }
         stage('Deploy') {
             steps {
-                // Output will be something like "go version go1.19 darwin/arm64"
-                // sh 'make push'
                 sh 'docker buildx rm plugin || true'
                 sh 'docker buildx create --name plugin --use --bootstrap'
-                sh 'docker buildx build -f .cloud/docker/Dockerfile --platform linux/amd64,linux/arm64 --target plugin --tag codeclarityce/service-dispatcher:latest --tag $Tag --push .'
+                script {
+                    def result = sh(script: "sh .cloud/jenkins/check_version.sh ${Version}", returnStatus: true)
+                    if (result == 0) {
+                        sh 'docker buildx build -f .cloud/docker/Dockerfile --platform linux/amd64,linux/arm64 --target plugin --tag codeclarityce/service-dispatcher:latest --tag $Tag --push .'
+                    }
+                }
             }
         }
     }
