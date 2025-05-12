@@ -5,7 +5,7 @@ ARG USERNAME=codeclarity
 ARG PLUGINNAME=plugin
 
 # DEV IMAGE
-FROM golang:1.24.2-alpine AS plugin-dev
+FROM golang:1.24.3-alpine AS plugin-dev
 ARG KIND
 ARG PLUGINNAME
 WORKDIR /codeclarity/${KIND}/${PLUGINNAME}
@@ -15,7 +15,7 @@ RUN go install github.com/air-verse/air@latest
 CMD ["air", "-c", ".air.toml"]
 
 # DEBUG IMAGE
-FROM golang:1.24.2-alpine AS plugin-debug
+FROM golang:1.24.3-alpine AS plugin-debug
 ARG KIND
 ARG PLUGINNAME
 ENV KIND=${KIND}
@@ -29,7 +29,7 @@ CMD ["/go/bin/dlv", "debug", ".", "--headless", "--listen=:40000", "--accept-mul
 
 
 # BUILD IMAGE
-FROM golang:1.24.2-alpine AS plugin-build
+FROM golang:1.24.3-alpine AS plugin-build
 ARG KIND
 ARG PLUGINNAME
 COPY . /codeclarity/${KIND}/${PLUGINNAME}
