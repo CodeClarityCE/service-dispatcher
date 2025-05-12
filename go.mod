@@ -3,7 +3,7 @@ module github.com/CodeClarityCE/service-dispatcher
 go 1.24.3
 
 require (
-	github.com/CodeClarityCE/utility-types v0.0.5-alpha
+	github.com/CodeClarityCE/utility-types v0.0.6-alpha
 	github.com/google/uuid v1.6.0
 	github.com/rabbitmq/amqp091-go v1.10.0
 	github.com/uptrace/bun v1.2.11
