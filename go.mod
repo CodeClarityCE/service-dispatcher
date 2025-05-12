@@ -1,8 +1,6 @@
 module github.com/CodeClarityCE/service-dispatcher
 
-go 1.23.0
-
-toolchain go1.24.1
+go 1.24.3
 
 require (
 	github.com/CodeClarityCE/utility-types v0.0.5-alpha
