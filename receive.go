@@ -150,10 +150,24 @@ func dispatch(connection string, d amqp.Delivery) {
 		return
 	}
 	if connection == "api_request" { // If message is from api_request
-		// Read message from API
-		var apiMessage types_amqp.APIDispatcherMessage
-		json.Unmarshal([]byte(d.Body), &apiMessage)
-		analysis_id := apiMessage.AnalysisId
+		// Read message from API - handle both string and UUID formats
+		var rawMessage map[string]interface{}
+		json.Unmarshal([]byte(d.Body), &rawMessage)
+		
+		// Debug: print the entire message to see what we're receiving
+		log.Printf("Debug: Received message: %+v", rawMessage)
+		
+		// Parse analysis_id as string first, then convert to UUID
+		analysis_id_str, ok := rawMessage["analysis_id"].(string)
+		if !ok {
+			log.Printf("Error: analysis_id is not a string, got: %T %+v", rawMessage["analysis_id"], rawMessage["analysis_id"])
+			return
+		}
+		analysis_id, err := uuid.Parse(analysis_id_str)
+		if err != nil {
+			log.Printf("Error parsing analysis_id: %v", err)
+			return
+		}
 
 		dsn := "postgres://" + user + ":" + password + "@" + host + ":" + port + "/" + name + "?sslmode=disable"
 		sqldb := sql.OpenDB(pgdriver.NewConnector(pgdriver.WithDSN(dsn), pgdriver.WithTimeout(50*time.Second)))
@@ -165,7 +179,7 @@ func dispatch(connection string, d amqp.Delivery) {
 		}
 
 		ctx := context.Background()
-		err := db.NewSelect().Model(analysis_document).WherePK().Scan(ctx)
+		err = db.NewSelect().Model(analysis_document).WherePK().Scan(ctx)
 		if err != nil {
 			panic(err)
 		}
@@ -188,13 +202,48 @@ func dispatch(connection string, d amqp.Delivery) {
 			panic(err)
 		}
 
+		// Parse other required fields from raw message
+		project_id_str, ok := rawMessage["project_id"].(string)
+		if !ok {
+			log.Printf("Error: project_id is not a string, got: %T %+v", rawMessage["project_id"], rawMessage["project_id"])
+			return
+		}
+		project_id, err := uuid.Parse(project_id_str)
+		if err != nil {
+			log.Printf("Error parsing project_id: %v", err)
+			return
+		}
+
+		organization_id_str, ok := rawMessage["organization_id"].(string)
+		if !ok {
+			log.Printf("Error: organization_id is not a string")
+			return
+		}
+		organization_id, err := uuid.Parse(organization_id_str)
+		if err != nil {
+			log.Printf("Error parsing organization_id: %v", err)
+			return
+		}
+
+		// Parse integration_id (can be null)
+		var integration_id uuid.UUID
+		if integration_id_raw := rawMessage["integration_id"]; integration_id_raw != nil {
+			if integration_id_str, ok := integration_id_raw.(string); ok && integration_id_str != "" {
+				integration_id, err = uuid.Parse(integration_id_str)
+				if err != nil {
+					log.Printf("Error parsing integration_id: %v", err)
+					return
+				}
+			}
+		}
+
 		// If integration is set, send message to downloader_dispatcher
-		if apiMessage.IntegrationId != uuid.Nil {
+		if integration_id != uuid.Nil {
 			dispatcherMessage := types_amqp.DispatcherDownloaderMessage{
 				AnalysisId:     analysis_id,
-				ProjectId:      apiMessage.ProjectId,
-				IntegrationId:  apiMessage.IntegrationId,
-				OrganizationId: apiMessage.OrganizationId,
+				ProjectId:      project_id,
+				IntegrationId:  integration_id,
+				OrganizationId: organization_id,
 			}
 
 			data, _ := json.Marshal(dispatcherMessage)
@@ -202,13 +251,19 @@ func dispatch(connection string, d amqp.Delivery) {
 			// Send message to downloader_dispatcher to download projects
 			send("dispatcher_downloader", data)
 		} else {
+			// Parse config from raw message
+			var config map[string]interface{}
+			if configRaw := rawMessage["config"]; configRaw != nil {
+				config, _ = configRaw.(map[string]interface{})
+			}
+
 			// For each plugin in step 0
 			for step_id, step := range analysis_document.Steps[0] {
 				// Start plugin by sending message to dispatcher_plugin
 				dispatcherMessage := types_amqp.DispatcherPluginMessage{
 					AnalysisId:     analysis_document.Id,
-					OrganizationId: apiMessage.OrganizationId,
-					Data:           apiMessage.Config,
+					OrganizationId: organization_id,
+					Data:           config,
 				}
 				data, _ := json.Marshal(dispatcherMessage)
 				analysis_document.Steps[0][step_id].Status = codeclarity.STARTED
