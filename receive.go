@@ -153,10 +153,10 @@ func dispatch(connection string, d amqp.Delivery) {
 		// Read message from API - handle both string and UUID formats
 		var rawMessage map[string]interface{}
 		json.Unmarshal([]byte(d.Body), &rawMessage)
-		
+
 		// Debug: print the entire message to see what we're receiving
 		log.Printf("Debug: Received message: %+v", rawMessage)
-		
+
 		// Parse analysis_id as string first, then convert to UUID
 		analysis_id_str, ok := rawMessage["analysis_id"].(string)
 		if !ok {
