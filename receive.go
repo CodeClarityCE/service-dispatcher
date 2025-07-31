@@ -107,7 +107,7 @@ func receiveMessage(connection string) {
 		}
 	}()
 
-	log.Printf(" [*] DISPATCHER Waiting for messages on " + connection + ". To exit press CTRL+C")
+	log.Printf("%s", " [*] DISPATCHER Waiting for messages on "+connection+". To exit press CTRL+C")
 	<-forever
 }
 
