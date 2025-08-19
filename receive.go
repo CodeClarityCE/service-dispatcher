@@ -111,6 +111,110 @@ func receiveMessage(connection string) {
 	<-forever
 }
 
+// startPluginsWithDependencyResolution starts plugins in the given stage using dependency resolution
+func startPluginsWithDependencyResolution(analysis *codeclarity.Analysis, stageIndex int, organizationId uuid.UUID, config map[string]interface{}, db *bun.DB) error {
+	ctx := context.Background()
+	
+	if dependencyResolver == nil {
+		log.Printf("Warning: Dependency resolver not initialized, falling back to parallel execution")
+		return startAllPluginsInStage(analysis, stageIndex, organizationId, config, db)
+	}
+
+	log.Printf("Starting stage %d with dependency resolution", stageIndex)
+	
+	// Get plugins that are ready to run (dependencies satisfied)
+	readyPlugins, err := dependencyResolver.GetReadyPlugins(analysis, stageIndex)
+	if err != nil {
+		log.Printf("Error getting ready plugins: %v", err)
+		return startAllPluginsInStage(analysis, stageIndex, organizationId, config, db)
+	}
+
+	if len(readyPlugins) == 0 {
+		log.Printf("No plugins ready to run in stage %d", stageIndex)
+		return nil
+	}
+
+	// Sort plugins topologically within the ready set
+	sortedPlugins := dependencyResolver.TopologicalSort(readyPlugins)
+	
+	log.Printf("Starting %d plugins in dependency order: %v", len(sortedPlugins), getPluginNames(sortedPlugins))
+
+	// Start plugins in dependency order
+	for stepId, step := range analysis.Steps[stageIndex] {
+		// Check if this plugin is in the ready list
+		for _, readyPlugin := range sortedPlugins {
+			if step.Name == readyPlugin.Name {
+				log.Printf("Starting plugin %s (dependency-resolved)", step.Name)
+				
+				dispatcherMessage := types_amqp.DispatcherPluginMessage{
+					AnalysisId:     analysis.Id,
+					OrganizationId: organizationId,
+					Data:           config,
+				}
+				data, _ := json.Marshal(dispatcherMessage)
+				analysis.Steps[stageIndex][stepId].Status = codeclarity.STARTED
+
+				err := db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
+					_, updateErr := tx.NewUpdate().Model(analysis).WherePK().Exec(ctx)
+					return updateErr
+				})
+
+				if err != nil {
+					log.Printf("Error updating analysis for plugin %s: %v", step.Name, err)
+					return err
+				}
+				
+				send("dispatcher_"+step.Name, data)
+				break
+			}
+		}
+	}
+
+	return nil
+}
+
+// startAllPluginsInStage starts all plugins in a stage without dependency resolution (fallback)
+func startAllPluginsInStage(analysis *codeclarity.Analysis, stageIndex int, organizationId uuid.UUID, config map[string]interface{}, db *bun.DB) error {
+	ctx := context.Background()
+	
+	log.Printf("Starting all plugins in stage %d (no dependency resolution)", stageIndex)
+	
+	for stepId, step := range analysis.Steps[stageIndex] {
+		log.Printf("Starting plugin %s (parallel mode)", step.Name)
+		
+		dispatcherMessage := types_amqp.DispatcherPluginMessage{
+			AnalysisId:     analysis.Id,
+			OrganizationId: organizationId,
+			Data:           config,
+		}
+		data, _ := json.Marshal(dispatcherMessage)
+		analysis.Steps[stageIndex][stepId].Status = codeclarity.STARTED
+
+		err := db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
+			_, updateErr := tx.NewUpdate().Model(analysis).WherePK().Exec(ctx)
+			return updateErr
+		})
+
+		if err != nil {
+			log.Printf("Error updating analysis for plugin %s: %v", step.Name, err)
+			return err
+		}
+		
+		send("dispatcher_"+step.Name, data)
+	}
+	
+	return nil
+}
+
+// getPluginNames extracts plugin names from steps for logging
+func getPluginNames(steps []codeclarity.Step) []string {
+	names := make([]string, len(steps))
+	for i, step := range steps {
+		names[i] = step.Name
+	}
+	return names
+}
+
 // dispatch is a function that handles the dispatching of messages based on the connection type.
 // It takes a connection string and an amqp.Delivery object as parameters.
 // If the connection is "api_request", it reads the message from the API, opens the database,
@@ -257,26 +361,11 @@ func dispatch(connection string, d amqp.Delivery) {
 				config, _ = configRaw.(map[string]interface{})
 			}
 
-			// For each plugin in step 0
-			for step_id, step := range analysis_document.Steps[0] {
-				// Start plugin by sending message to dispatcher_plugin
-				dispatcherMessage := types_amqp.DispatcherPluginMessage{
-					AnalysisId:     analysis_document.Id,
-					OrganizationId: organization_id,
-					Data:           config,
-				}
-				data, _ := json.Marshal(dispatcherMessage)
-				analysis_document.Steps[0][step_id].Status = codeclarity.STARTED
-
-				err := db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
-					_, err = tx.NewUpdate().Model(analysis_document).WherePK().Exec(ctx)
-					return err
-				})
-
-				if err != nil {
-					panic(err)
-				}
-				send("dispatcher_"+step.Name, data)
+			// Start plugins with dependency resolution
+			err = startPluginsWithDependencyResolution(analysis_document, 0, organization_id, config, db)
+			if err != nil {
+				log.Printf("Error starting plugins in stage 0: %v", err)
+				panic(err)
 			}
 		}
 
@@ -300,25 +389,11 @@ func dispatch(connection string, d amqp.Delivery) {
 			panic(err)
 		}
 
-		// For each plugin in step 0
-		for step_id, step := range analysis_document.Steps[0] {
-			// Start plugin by sending message to dispatcher_plugin
-			dispatcherMessage := types_amqp.DispatcherPluginMessage{
-				AnalysisId:     analysis_document.Id,
-				OrganizationId: apiMessage.OrganizationId,
-			}
-			data, _ := json.Marshal(dispatcherMessage)
-			analysis_document.Steps[0][step_id].Status = codeclarity.STARTED
-
-			err := db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
-				_, err = tx.NewUpdate().Model(analysis_document).WherePK().Exec(ctx)
-				return err
-			})
-
-			if err != nil {
-				panic(err)
-			}
-			send("dispatcher_"+step.Name, data)
+		// Start plugins with dependency resolution
+		err = startPluginsWithDependencyResolution(analysis_document, 0, apiMessage.OrganizationId, nil, db)
+		if err != nil {
+			log.Printf("Error starting plugins in stage 0: %v", err)
+			panic(err)
 		}
 
 		// Commit transaction
@@ -397,20 +472,32 @@ func dispatch(connection string, d amqp.Delivery) {
 					panic(err)
 				}
 			} else {
-				// For each plugin in step 0
-				for step_id, step := range analysis_document.Steps[analysis_document.Stage] {
-					// Start plugin by sending message to dispatcher_plugin
-					dispatcherMessage := types_amqp.DispatcherPluginMessage{
-						AnalysisId:     pluginMessage.AnalysisId,
-						OrganizationId: analysis_document.OrganizationId,
-					}
-					data, _ := json.Marshal(dispatcherMessage)
-					send("dispatcher_"+step.Name, data)
-					analysis_document.Steps[analysis_document.Stage][step_id].Status = codeclarity.STARTED
-					// TODO create transaction or check if this is atomic
-					_, err = db.NewUpdate().Model(analysis_document).WherePK().Exec(ctx)
+				// Start plugins with dependency resolution for the next stage
+				err = startPluginsWithDependencyResolution(analysis_document, analysis_document.Stage, analysis_document.OrganizationId, nil, db)
+				if err != nil {
+					log.Printf("Error starting plugins in stage %d: %v", analysis_document.Stage, err)
+					panic(err)
+				}
+			}
+		}
+
+		// Check if there are any plugins in the current or previous stages that might now be ready to run
+		if dependencyResolver != nil && dependencyResolver.HasPendingDependentPlugins(analysis_document) {
+			log.Printf("Found plugins with satisfied dependencies, checking all stages for ready plugins")
+			
+			// Check all stages for plugins that might now be ready
+			for stageIndex := 0; stageIndex <= analysis_document.Stage && stageIndex < len(analysis_document.Steps); stageIndex++ {
+				readyPlugins, err := dependencyResolver.GetReadyPlugins(analysis_document, stageIndex)
+				if err != nil {
+					log.Printf("Error checking ready plugins in stage %d: %v", stageIndex, err)
+					continue
+				}
+				
+				if len(readyPlugins) > 0 {
+					log.Printf("Starting %d newly ready plugins in stage %d", len(readyPlugins), stageIndex)
+					err = startPluginsWithDependencyResolution(analysis_document, stageIndex, analysis_document.OrganizationId, nil, db)
 					if err != nil {
-						panic(err)
+						log.Printf("Error starting ready plugins in stage %d: %v", stageIndex, err)
 					}
 				}
 			}
