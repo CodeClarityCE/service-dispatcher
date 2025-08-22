@@ -5,119 +5,24 @@ import (
 	"database/sql"
 	"encoding/json"
 	"log"
-	"os"
 	"time"
 
+	"github.com/CodeClarityCE/utility-types/boilerplates"
 	types_amqp "github.com/CodeClarityCE/utility-types/amqp"
 	codeclarity "github.com/CodeClarityCE/utility-types/codeclarity_db"
 	"github.com/google/uuid"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect/pgdialect"
-	"github.com/uptrace/bun/driver/pgdriver"
 )
 
-// receiveMessage receives messages from a RabbitMQ queue and dispatches them for processing.
-// It establishes a connection to RabbitMQ, opens a channel, declares a queue, and consumes messages from the queue.
-// Each received message is passed to the dispatch function for further processing.
-// The function runs indefinitely until interrupted by a signal.
-//
-// Parameters:
-// - connection: The name of the RabbitMQ queue to consume messages from.
-//
-// Example usage:
-// receiveMessage("my_queue")
-func receiveMessage(connection string) {
-	// Create connexion
-	url := ""
-	protocol := os.Getenv("AMQP_PROTOCOL")
-	if protocol == "" {
-		protocol = "amqp"
-	}
-	host := os.Getenv("AMQP_HOST")
-	if host == "" {
-		host = "localhost"
-	}
-	port := os.Getenv("AMQP_PORT")
-	if port == "" {
-		port = "5672"
-	}
-	user := os.Getenv("AMQP_USER")
-	if user == "" {
-		user = "guest"
-	}
-	password := os.Getenv("AMQP_PASSWORD")
-	if password == "" {
-		password = "guest"
-	}
-	url = protocol + "://" + user + ":" + password + "@" + host + ":" + port + "/"
-
-	conn, err := amqp.Dial(url)
-	if err != nil {
-		failOnError(err, "Failed to connect to RabbitMQ")
-	}
-	defer conn.Close()
-
-	// Open channel
-	ch, err := conn.Channel()
-	if err != nil {
-		failOnError(err, "Failed to open a channel")
-	}
-	defer ch.Close()
-
-	// Declare queue
-	q, err := ch.QueueDeclare(
-		connection, // name
-		true,       // durable
-		false,      // delete when unused
-		false,      // exclusive
-		false,      // no-wait
-		nil,        // arguments
-	)
-	if err != nil {
-		failOnError(err, "Failed to declare a queue")
-	}
-
-	// Consume messages
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	if err != nil {
-		failOnError(err, "Failed to register a consumer")
-	}
-
-	var forever = make(chan struct{})
-	go func() {
-		for d := range msgs {
-			// Start timer
-			start := time.Now()
-
-			dispatch(connection, d)
-
-			// Print time elapsed
-			t := time.Now()
-			elapsed := t.Sub(start)
-			log.Println(elapsed)
-		}
-	}()
-
-	log.Printf("%s", " [*] DISPATCHER Waiting for messages on "+connection+". To exit press CTRL+C")
-	<-forever
-}
 
 // startPluginsWithDependencyResolution starts plugins in the given stage using dependency resolution
-func startPluginsWithDependencyResolution(analysis *codeclarity.Analysis, stageIndex int, organizationId uuid.UUID, config map[string]interface{}, db *bun.DB) error {
+func startPluginsWithDependencyResolution(analysis *codeclarity.Analysis, stageIndex int, organizationId uuid.UUID, config map[string]interface{}, db *bun.DB, dependencyResolver *DependencyResolver, service *boilerplates.ServiceBase) error {
 	ctx := context.Background()
 	
 	if dependencyResolver == nil {
 		log.Printf("Warning: Dependency resolver not initialized, falling back to parallel execution")
-		return startAllPluginsInStage(analysis, stageIndex, organizationId, config, db)
+		return startAllPluginsInStage(analysis, stageIndex, organizationId, config, db, service)
 	}
 
 	log.Printf("Starting stage %d with dependency resolution", stageIndex)
@@ -126,7 +31,7 @@ func startPluginsWithDependencyResolution(analysis *codeclarity.Analysis, stageI
 	readyPlugins, err := dependencyResolver.GetReadyPlugins(analysis, stageIndex)
 	if err != nil {
 		log.Printf("Error getting ready plugins: %v", err)
-		return startAllPluginsInStage(analysis, stageIndex, organizationId, config, db)
+		return startAllPluginsInStage(analysis, stageIndex, organizationId, config, db, service)
 	}
 
 	if len(readyPlugins) == 0 {
@@ -164,7 +69,10 @@ func startPluginsWithDependencyResolution(analysis *codeclarity.Analysis, stageI
 					return err
 				}
 				
-				send("dispatcher_"+step.Name, data)
+				err = service.SendMessage("dispatcher_"+step.Name, data)
+				if err != nil {
+					log.Printf("Failed to send message to dispatcher_%s: %v", step.Name, err)
+				}
 				break
 			}
 		}
@@ -174,7 +82,7 @@ func startPluginsWithDependencyResolution(analysis *codeclarity.Analysis, stageI
 }
 
 // startAllPluginsInStage starts all plugins in a stage without dependency resolution (fallback)
-func startAllPluginsInStage(analysis *codeclarity.Analysis, stageIndex int, organizationId uuid.UUID, config map[string]interface{}, db *bun.DB) error {
+func startAllPluginsInStage(analysis *codeclarity.Analysis, stageIndex int, organizationId uuid.UUID, config map[string]interface{}, db *bun.DB, service *boilerplates.ServiceBase) error {
 	ctx := context.Background()
 	
 	log.Printf("Starting all plugins in stage %d (no dependency resolution)", stageIndex)
@@ -200,7 +108,10 @@ func startAllPluginsInStage(analysis *codeclarity.Analysis, stageIndex int, orga
 			return err
 		}
 		
-		send("dispatcher_"+step.Name, data)
+		err = service.SendMessage("dispatcher_"+step.Name, data)
+		if err != nil {
+			log.Printf("Failed to send message to dispatcher_%s: %v", step.Name, err)
+		}
 	}
 	
 	return nil
@@ -227,32 +138,7 @@ func getPluginNames(steps []codeclarity.Step) []string {
 // retrieves the analysis document, checks if the current stage is completed, and if so,
 // goes to the next stage and starts each plugin in the new stage by sending a message to the dispatcher_plugin.
 // The function also handles error logging and transaction commits.
-func dispatch(connection string, d amqp.Delivery) {
-	host := os.Getenv("PG_DB_HOST")
-	if host == "" {
-		log.Printf("PG_DB_HOST is not set")
-		return
-	}
-	port := os.Getenv("PG_DB_PORT")
-	if port == "" {
-		log.Printf("PG_DB_PORT is not set")
-		return
-	}
-	user := os.Getenv("PG_DB_USER")
-	if user == "" {
-		log.Printf("PG_DB_USER is not set")
-		return
-	}
-	password := os.Getenv("PG_DB_PASSWORD")
-	if password == "" {
-		log.Printf("PG_DB_PASSWORD is not set")
-		return
-	}
-	name := os.Getenv("PG_DB_NAME")
-	if name == "" {
-		log.Printf("PG_DB_NAME is not set")
-		return
-	}
+func dispatch(connection string, d amqp.Delivery, dependencyResolver *DependencyResolver, service *boilerplates.ServiceBase) {
 	if connection == "api_request" { // If message is from api_request
 		// Read message from API - handle both string and UUID formats
 		var rawMessage map[string]interface{}
@@ -273,10 +159,7 @@ func dispatch(connection string, d amqp.Delivery) {
 			return
 		}
 
-		dsn := "postgres://" + user + ":" + password + "@" + host + ":" + port + "/" + name + "?sslmode=disable"
-		sqldb := sql.OpenDB(pgdriver.NewConnector(pgdriver.WithDSN(dsn), pgdriver.WithTimeout(50*time.Second)))
-		db := bun.NewDB(sqldb, pgdialect.New())
-		defer db.Close()
+		db := service.DB.CodeClarity
 
 		analysis_document := &codeclarity.Analysis{
 			Id: analysis_id,
@@ -353,7 +236,10 @@ func dispatch(connection string, d amqp.Delivery) {
 			data, _ := json.Marshal(dispatcherMessage)
 
 			// Send message to downloader_dispatcher to download projects
-			send("dispatcher_downloader", data)
+			err = service.SendMessage("dispatcher_downloader", data)
+			if err != nil {
+				log.Printf("Failed to send message to dispatcher_downloader: %v", err)
+			}
 		} else {
 			// Parse config from raw message
 			var config map[string]interface{}
@@ -362,7 +248,7 @@ func dispatch(connection string, d amqp.Delivery) {
 			}
 
 			// Start plugins with dependency resolution
-			err = startPluginsWithDependencyResolution(analysis_document, 0, organization_id, config, db)
+			err = startPluginsWithDependencyResolution(analysis_document, 0, organization_id, config, db, dependencyResolver, service)
 			if err != nil {
 				log.Printf("Error starting plugins in stage 0: %v", err)
 				panic(err)
@@ -375,10 +261,7 @@ func dispatch(connection string, d amqp.Delivery) {
 		json.Unmarshal([]byte(d.Body), &apiMessage)
 		analysis_id := apiMessage.AnalysisId
 
-		dsn := "postgres://" + user + ":" + password + "@" + host + ":" + port + "/" + name + "?sslmode=disable"
-		sqldb := sql.OpenDB(pgdriver.NewConnector(pgdriver.WithDSN(dsn), pgdriver.WithTimeout(50*time.Second)))
-		db := bun.NewDB(sqldb, pgdialect.New())
-		defer db.Close()
+		db := service.DB.CodeClarity
 		// Get analysis
 		analysis_document := &codeclarity.Analysis{
 			Id: analysis_id,
@@ -390,7 +273,7 @@ func dispatch(connection string, d amqp.Delivery) {
 		}
 
 		// Start plugins with dependency resolution
-		err = startPluginsWithDependencyResolution(analysis_document, 0, apiMessage.OrganizationId, nil, db)
+		err = startPluginsWithDependencyResolution(analysis_document, 0, apiMessage.OrganizationId, nil, db, dependencyResolver, service)
 		if err != nil {
 			log.Printf("Error starting plugins in stage 0: %v", err)
 			panic(err)
@@ -409,10 +292,7 @@ func dispatch(connection string, d amqp.Delivery) {
 		json.Unmarshal([]byte(d.Body), &pluginMessage)
 
 		// Open DB
-		dsn := "postgres://" + user + ":" + password + "@" + host + ":" + port + "/" + name + "?sslmode=disable"
-		sqldb := sql.OpenDB(pgdriver.NewConnector(pgdriver.WithDSN(dsn), pgdriver.WithTimeout(50*time.Second)))
-		db := bun.NewDB(sqldb, pgdialect.New())
-		defer db.Close()
+		db := service.DB.CodeClarity
 
 		// Get analysis
 		analysis_document := &codeclarity.Analysis{
@@ -473,7 +353,7 @@ func dispatch(connection string, d amqp.Delivery) {
 				}
 			} else {
 				// Start plugins with dependency resolution for the next stage
-				err = startPluginsWithDependencyResolution(analysis_document, analysis_document.Stage, analysis_document.OrganizationId, nil, db)
+				err = startPluginsWithDependencyResolution(analysis_document, analysis_document.Stage, analysis_document.OrganizationId, nil, db, dependencyResolver, service)
 				if err != nil {
 					log.Printf("Error starting plugins in stage %d: %v", analysis_document.Stage, err)
 					panic(err)
@@ -495,7 +375,7 @@ func dispatch(connection string, d amqp.Delivery) {
 				
 				if len(readyPlugins) > 0 {
 					log.Printf("Starting %d newly ready plugins in stage %d", len(readyPlugins), stageIndex)
-					err = startPluginsWithDependencyResolution(analysis_document, stageIndex, analysis_document.OrganizationId, nil, db)
+					err = startPluginsWithDependencyResolution(analysis_document, stageIndex, analysis_document.OrganizationId, nil, db, dependencyResolver, service)
 					if err != nil {
 						log.Printf("Error starting ready plugins in stage %d: %v", stageIndex, err)
 					}

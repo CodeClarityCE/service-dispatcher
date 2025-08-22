@@ -2,17 +2,12 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"log"
-	"os"
-	"time"
 
 	codeclarity "github.com/CodeClarityCE/utility-types/codeclarity_db"
 	plugin_db "github.com/CodeClarityCE/utility-types/plugin_db"
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect/pgdialect"
-	"github.com/uptrace/bun/driver/pgdriver"
 )
 
 // DependencyResolver handles plugin dependency resolution and scheduling
@@ -20,37 +15,15 @@ type DependencyResolver struct {
 	pluginConfigs map[string]plugin_db.Plugin
 }
 
-// NewDependencyResolver creates a new dependency resolver
-func NewDependencyResolver() *DependencyResolver {
+// CreateDependencyResolver creates a new dependency resolver
+func CreateDependencyResolver() *DependencyResolver {
 	return &DependencyResolver{
 		pluginConfigs: make(map[string]plugin_db.Plugin),
 	}
 }
 
 // LoadPluginConfigurations loads all plugin configurations from the database
-func (dr *DependencyResolver) LoadPluginConfigurations() error {
-	host := os.Getenv("PG_DB_HOST")
-	if host == "" {
-		return fmt.Errorf("PG_DB_HOST is not set")
-	}
-	port := os.Getenv("PG_DB_PORT")
-	if port == "" {
-		return fmt.Errorf("PG_DB_PORT is not set")
-	}
-	user := os.Getenv("PG_DB_USER")
-	if user == "" {
-		return fmt.Errorf("PG_DB_USER is not set")
-	}
-	password := os.Getenv("PG_DB_PASSWORD")
-	if password == "" {
-		return fmt.Errorf("PG_DB_PASSWORD is not set")
-	}
-
-	// Connect to plugin database
-	dsn := "postgres://" + user + ":" + password + "@" + host + ":" + port + "/plugins?sslmode=disable"
-	sqldb := sql.OpenDB(pgdriver.NewConnector(pgdriver.WithDSN(dsn), pgdriver.WithTimeout(30*time.Second)))
-	db := bun.NewDB(sqldb, pgdialect.New())
-	defer db.Close()
+func (dr *DependencyResolver) LoadPluginConfigurations(db *bun.DB) error {
 
 	// Load all plugin configurations
 	var plugins []plugin_db.Plugin
