@@ -7,26 +7,25 @@ import (
 	"log"
 	"time"
 
-	"github.com/CodeClarityCE/utility-types/boilerplates"
 	types_amqp "github.com/CodeClarityCE/utility-types/amqp"
+	"github.com/CodeClarityCE/utility-types/boilerplates"
 	codeclarity "github.com/CodeClarityCE/utility-types/codeclarity_db"
 	"github.com/google/uuid"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/uptrace/bun"
 )
 
-
 // startPluginsWithDependencyResolution starts plugins in the given stage using dependency resolution
 func startPluginsWithDependencyResolution(analysis *codeclarity.Analysis, stageIndex int, organizationId uuid.UUID, config map[string]interface{}, db *bun.DB, dependencyResolver *DependencyResolver, service *boilerplates.ServiceBase) error {
 	ctx := context.Background()
-	
+
 	if dependencyResolver == nil {
 		log.Printf("Warning: Dependency resolver not initialized, falling back to parallel execution")
 		return startAllPluginsInStage(analysis, stageIndex, organizationId, config, db, service)
 	}
 
 	log.Printf("Starting stage %d with dependency resolution", stageIndex)
-	
+
 	// Get plugins that are ready to run (dependencies satisfied)
 	readyPlugins, err := dependencyResolver.GetReadyPlugins(analysis, stageIndex)
 	if err != nil {
@@ -41,7 +40,7 @@ func startPluginsWithDependencyResolution(analysis *codeclarity.Analysis, stageI
 
 	// Sort plugins topologically within the ready set
 	sortedPlugins := dependencyResolver.TopologicalSort(readyPlugins)
-	
+
 	log.Printf("Starting %d plugins in dependency order: %v", len(sortedPlugins), getPluginNames(sortedPlugins))
 
 	// Start plugins in dependency order
@@ -50,7 +49,7 @@ func startPluginsWithDependencyResolution(analysis *codeclarity.Analysis, stageI
 		for _, readyPlugin := range sortedPlugins {
 			if step.Name == readyPlugin.Name {
 				log.Printf("Starting plugin %s (dependency-resolved)", step.Name)
-				
+
 				dispatcherMessage := types_amqp.DispatcherPluginMessage{
 					AnalysisId:     analysis.Id,
 					OrganizationId: organizationId,
@@ -68,7 +67,7 @@ func startPluginsWithDependencyResolution(analysis *codeclarity.Analysis, stageI
 					log.Printf("Error updating analysis for plugin %s: %v", step.Name, err)
 					return err
 				}
-				
+
 				err = service.SendMessage("dispatcher_"+step.Name, data)
 				if err != nil {
 					log.Printf("Failed to send message to dispatcher_%s: %v", step.Name, err)
@@ -84,12 +83,12 @@ func startPluginsWithDependencyResolution(analysis *codeclarity.Analysis, stageI
 // startAllPluginsInStage starts all plugins in a stage without dependency resolution (fallback)
 func startAllPluginsInStage(analysis *codeclarity.Analysis, stageIndex int, organizationId uuid.UUID, config map[string]interface{}, db *bun.DB, service *boilerplates.ServiceBase) error {
 	ctx := context.Background()
-	
+
 	log.Printf("Starting all plugins in stage %d (no dependency resolution)", stageIndex)
-	
+
 	for stepId, step := range analysis.Steps[stageIndex] {
 		log.Printf("Starting plugin %s (parallel mode)", step.Name)
-		
+
 		dispatcherMessage := types_amqp.DispatcherPluginMessage{
 			AnalysisId:     analysis.Id,
 			OrganizationId: organizationId,
@@ -107,13 +106,13 @@ func startAllPluginsInStage(analysis *codeclarity.Analysis, stageIndex int, orga
 			log.Printf("Error updating analysis for plugin %s: %v", step.Name, err)
 			return err
 		}
-		
+
 		err = service.SendMessage("dispatcher_"+step.Name, data)
 		if err != nil {
 			log.Printf("Failed to send message to dispatcher_%s: %v", step.Name, err)
 		}
 	}
-	
+
 	return nil
 }
 
@@ -364,7 +363,7 @@ func dispatch(connection string, d amqp.Delivery, dependencyResolver *Dependency
 		// Check if there are any plugins in the current or previous stages that might now be ready to run
 		if dependencyResolver != nil && dependencyResolver.HasPendingDependentPlugins(analysis_document) {
 			log.Printf("Found plugins with satisfied dependencies, checking all stages for ready plugins")
-			
+
 			// Check all stages for plugins that might now be ready
 			for stageIndex := 0; stageIndex <= analysis_document.Stage && stageIndex < len(analysis_document.Steps); stageIndex++ {
 				readyPlugins, err := dependencyResolver.GetReadyPlugins(analysis_document, stageIndex)
@@ -372,7 +371,7 @@ func dispatch(connection string, d amqp.Delivery, dependencyResolver *Dependency
 					log.Printf("Error checking ready plugins in stage %d: %v", stageIndex, err)
 					continue
 				}
-				
+
 				if len(readyPlugins) > 0 {
 					log.Printf("Starting %d newly ready plugins in stage %d", len(readyPlugins), stageIndex)
 					err = startPluginsWithDependencyResolution(analysis_document, stageIndex, analysis_document.OrganizationId, nil, db, dependencyResolver, service)

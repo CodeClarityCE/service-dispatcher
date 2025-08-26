@@ -87,7 +87,7 @@ func (dr *DependencyResolver) areDependenciesSatisfied(pluginName string, analys
 
 	// Filter dependencies to only include plugins that are actually in this analysis
 	actualDependencies := dr.filterDependenciesByAnalysis(pluginConfig.DependsOn, analysis)
-	
+
 	if len(actualDependencies) == 0 {
 		log.Printf("Plugin %s has no dependencies in current analysis, ready to run", pluginName)
 		return true
@@ -103,7 +103,7 @@ func (dr *DependencyResolver) areDependenciesSatisfied(pluginName string, analys
 			for _, dependency := range actualDependencies {
 				if step.Name == dependency {
 					if step.Status != codeclarity.SUCCESS {
-						log.Printf("Dependency %s is not completed (status: %s) for plugin %s", 
+						log.Printf("Dependency %s is not completed (status: %s) for plugin %s",
 							dependency, step.Status, pluginName)
 						return false
 					}
@@ -126,7 +126,7 @@ func (dr *DependencyResolver) areDependenciesSatisfied(pluginName string, analys
 	return true
 }
 
-// filterDependenciesByAnalysis filters the dependency list to only include plugins 
+// filterDependenciesByAnalysis filters the dependency list to only include plugins
 // that are actually present in the current analysis
 func (dr *DependencyResolver) filterDependenciesByAnalysis(dependencies []string, analysis *codeclarity.Analysis) []string {
 	// Build a set of all plugins present in this analysis
@@ -136,7 +136,7 @@ func (dr *DependencyResolver) filterDependenciesByAnalysis(dependencies []string
 			analysisPlugins[step.Name] = true
 		}
 	}
-	
+
 	// Filter dependencies to only include those present in the analysis
 	var actualDependencies []string
 	for _, dependency := range dependencies {
@@ -146,7 +146,7 @@ func (dr *DependencyResolver) filterDependenciesByAnalysis(dependencies []string
 			log.Printf("Dependency %s not present in current analysis, skipping", dependency)
 		}
 	}
-	
+
 	return actualDependencies
 }
 
@@ -177,7 +177,7 @@ func (dr *DependencyResolver) TopologicalSort(plugins []codeclarity.Step) []code
 	// Keep adding plugins whose dependencies are in the processed set
 	for len(sorted) < len(plugins) {
 		addedInThisRound := false
-		
+
 		for _, plugin := range plugins {
 			if processed[plugin.Name] {
 				continue
@@ -195,7 +195,7 @@ func (dr *DependencyResolver) TopologicalSort(plugins []codeclarity.Step) []code
 							break
 						}
 					}
-					
+
 					if depInThisStage && !processed[dep] {
 						canAdd = false
 						break
