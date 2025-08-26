@@ -4,7 +4,7 @@ package main
 import (
 	"log"
 
-	"github.com/CodeClarityCE/utility-types/boilerplates"
+	"github.com/CodeClarityCE/utility-boilerplates"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 

@@ -7,8 +7,8 @@ import (
 	"log"
 	"time"
 
+	"github.com/CodeClarityCE/utility-boilerplates"
 	types_amqp "github.com/CodeClarityCE/utility-types/amqp"
-	"github.com/CodeClarityCE/utility-types/boilerplates"
 	codeclarity "github.com/CodeClarityCE/utility-types/codeclarity_db"
 	"github.com/google/uuid"
 	amqp "github.com/rabbitmq/amqp091-go"
