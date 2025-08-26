@@ -1,11 +1,11 @@
-github.com/CodeClarityCE/utility-amqp-helper v0.0.6-alpha h1:GoUTO+ADeFtQM9nFJRCJLgwoIPsSM5fkovNTaldROL0=
-github.com/CodeClarityCE/utility-amqp-helper v0.0.6-alpha/go.mod h1:fUDcdrVyeoVqzxCkbHWsdbhBHp1d6gvq3QFtQ5E3ptI=
+github.com/CodeClarityCE/utility-amqp-helper v0.0.7-alpha h1:hsPZcsXS6mH7omocbhuNdQWf1HAbw5vx6VimD/L/NmA=
+github.com/CodeClarityCE/utility-amqp-helper v0.0.7-alpha/go.mod h1:R79+h85lkx41lWutWdsPWYER1uqBaIbSeTeHDRwBp6Y=
 github.com/CodeClarityCE/utility-boilerplates v0.0.1 h1:erYZW3SEC3mgIea6Mwa5YIi7LJ7vrz5vXNsqgw1IqQY=
 github.com/CodeClarityCE/utility-boilerplates v0.0.1/go.mod h1:0vXgRk5Zmw21yAi/RPuuZlxWJLPU4VRzbBHyvKR7ycU=
-github.com/CodeClarityCE/utility-dbhelper v0.0.8-alpha h1:pvHAWe6J3yBr+JKTvx719B3C03f8C0/Ut7h3Dmn5iuU=
-github.com/CodeClarityCE/utility-dbhelper v0.0.8-alpha/go.mod h1:xKQuTWEsOiDS1QJg/BqlstOGg6l4LgnqRcZ9PjEhMKU=
-github.com/CodeClarityCE/utility-types v0.0.11-alpha h1:A5O5ow+35YSvjqNWExQi/15tlLqdGrKMF5/WGly8IFc=
-github.com/CodeClarityCE/utility-types v0.0.11-alpha/go.mod h1:/2YHkP9TV/k510uiB+1AIs9qDKFEI98CY/jqBr/AZ8A=
+github.com/CodeClarityCE/utility-dbhelper v0.0.9-alpha h1:qMYfslFf4+U1F1bJUGdWjd2OS6kKgo03fnEYCX7IkC0=
+github.com/CodeClarityCE/utility-dbhelper v0.0.9-alpha/go.mod h1:VvvYDSnjk5R/BnYrle0te1qgHzQw9YVjgv6q2eJrz9E=
+github.com/CodeClarityCE/utility-types v0.0.12-alpha h1:NIwkuxHBjIfDzijuNEmMYB6n0Qv6TolS+/PRtjAeW0U=
+github.com/CodeClarityCE/utility-types v0.0.12-alpha/go.mod h1:YeFca0wlFVGB2xVtSIaWTypObZwwo1SDYmlOmOAOu9s=
 github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
 github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6rlkpw=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
@@ -46,6 +46,7 @@ github.com/sirupsen/logrus v1.9.3/go.mod h1:naHLuLoDiP4jHNo9R0sCBMtWGeIprob74mVs
 github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
 github.com/stretchr/testify v1.7.0/go.mod h1:6Fq8oRcR53rry900zMqJjRRixrwX3KX962/h/Wwjteg=
 github.com/stretchr/testify v1.11.0 h1:ib4sjIrwZKxE5u/Japgo/7SJV3PvgjGiRNAvTVGqQl8=
+github.com/stretchr/testify v1.11.0/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
 github.com/tmthrgd/go-hex v0.0.0-20190904060850-447a3041c3bc h1:9lRDQMhESg+zvGYmW5DyG0UqvY96Bu5QYsTLvCHdrgo=
 github.com/tmthrgd/go-hex v0.0.0-20190904060850-447a3041c3bc/go.mod h1:bciPuU6GHm1iF1pBvUfxfsH0Wmnc2VbpgvbI9ZWuIRs=
 github.com/uptrace/bun v1.2.15 h1:Ut68XRBLDgp9qG9QBMa9ELWaZOmzHNdczHQdrOZbEFE=
