@@ -3,16 +3,16 @@ module github.com/CodeClarityCE/service-dispatcher
 go 1.24.3
 
 require (
-	github.com/CodeClarityCE/utility-boilerplates v0.0.2-alpha
-	github.com/CodeClarityCE/utility-types v0.0.13-alpha
+	github.com/CodeClarityCE/utility-boilerplates v0.0.3-alpha
+	github.com/CodeClarityCE/utility-types v0.0.14-alpha
 	github.com/google/uuid v1.6.0
 	github.com/rabbitmq/amqp091-go v1.10.0
 	github.com/uptrace/bun v1.2.15
 )
 
 require (
-	github.com/CodeClarityCE/utility-amqp-helper v0.0.8-alpha // indirect
-	github.com/CodeClarityCE/utility-dbhelper v0.0.10-alpha // indirect
+	github.com/CodeClarityCE/utility-amqp-helper v0.0.9-alpha // indirect
+	github.com/CodeClarityCE/utility-dbhelper v0.0.11-alpha // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/jinzhu/inflection v1.0.0 // indirect
@@ -23,7 +23,6 @@ require (
 	github.com/prometheus/common v0.67.1 // indirect
 	github.com/prometheus/procfs v0.17.0 // indirect
 	github.com/puzpuzpuz/xsync/v3 v3.5.1 // indirect
-	github.com/rogpeppe/go-internal v1.14.1 // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect
 	github.com/tmthrgd/go-hex v0.0.0-20190904060850-447a3041c3bc // indirect
 	github.com/uptrace/bun/dialect/pgdialect v1.2.15 // indirect

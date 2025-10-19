@@ -1,11 +1,11 @@
-github.com/CodeClarityCE/utility-amqp-helper v0.0.8-alpha h1:yyMpDFVH4HvOk3fGP9EZMJGNeZQPoNaU4B8faD3oqv0=
-github.com/CodeClarityCE/utility-amqp-helper v0.0.8-alpha/go.mod h1:cjpvcGXZYzFXqu9xq/g/8n4CPlmo3NoAKGWD9bjUo7Q=
-github.com/CodeClarityCE/utility-boilerplates v0.0.2-alpha h1:1WBWNh8tLK7HRnngnujNcJ88FSCYOPoE1v0lBOOI1oU=
-github.com/CodeClarityCE/utility-boilerplates v0.0.2-alpha/go.mod h1:rGpXJtlZJz08Zki9x6Ll4MuxcbSb4Vz5MnpE310btn0=
-github.com/CodeClarityCE/utility-dbhelper v0.0.10-alpha h1:MJks7SUnJZsRlUNklKjnPdAVHEFUUHttNJt++5E+i7c=
-github.com/CodeClarityCE/utility-dbhelper v0.0.10-alpha/go.mod h1:1Zk2Ffn6roPfnz1mBOfj1dWfFC9Ovf47TuCPDj9iXNY=
-github.com/CodeClarityCE/utility-types v0.0.13-alpha h1:HHzTJ6KuY91FGfPKUKUJDN4bqRgbEF29V8nB/UzCA+Y=
-github.com/CodeClarityCE/utility-types v0.0.13-alpha/go.mod h1:/6czsYuZa2kFTSMCHGk3d1WaQ+HAeVkMYAts9gVnan4=
+github.com/CodeClarityCE/utility-amqp-helper v0.0.9-alpha h1:uEGWkTiyfoRe0nNpVp8k0aMYOkwup8A7zWo6NZOp6k0=
+github.com/CodeClarityCE/utility-amqp-helper v0.0.9-alpha/go.mod h1:TGpptGh1SZWx0xvQsutG+2p9huG5MNCsppOmB9SMYGY=
+github.com/CodeClarityCE/utility-boilerplates v0.0.3-alpha h1:boz+JTzvgrA0nnBSEDiLikiU8Ku5zApvXoOcRsVm4oQ=
+github.com/CodeClarityCE/utility-boilerplates v0.0.3-alpha/go.mod h1:j3gkXUv9mSj0h3A0XeZsjjcpkvVHv7xgjC8hr9UVxZY=
+github.com/CodeClarityCE/utility-dbhelper v0.0.11-alpha h1:ljzB0sjfHExSTL0jF1f6HJPxJCeuWzVRlu8lmawN0rY=
+github.com/CodeClarityCE/utility-dbhelper v0.0.11-alpha/go.mod h1:WnmFeM9gyzjHk8Fm/b1ZPWcp2v1OFvfz4Ho/c944Hnk=
+github.com/CodeClarityCE/utility-types v0.0.14-alpha h1:QEf3dwwUMg6hkrl/gwcWhuJONNuKdQJkotL0WIXyr9k=
+github.com/CodeClarityCE/utility-types v0.0.14-alpha/go.mod h1:KutAfnY3p2oX2MZTh5IGabXIOnPJVtM8b6Q1Wwqe7DM=
 github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
 github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6rlkpw=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
@@ -46,6 +46,7 @@ github.com/puzpuzpuz/xsync/v3 v3.5.1/go.mod h1:VjzYrABPabuM4KyBh1Ftq6u8nhwY5tBPK
 github.com/rabbitmq/amqp091-go v1.10.0 h1:STpn5XsHlHGcecLmMFCtg7mqq0RnD+zFr4uzukfVhBw=
 github.com/rabbitmq/amqp091-go v1.10.0/go.mod h1:Hy4jKW5kQART1u+JkDTF9YYOQUHXqMuhrgxOEeS7G4o=
 github.com/rogpeppe/go-internal v1.14.1 h1:UQB4HGPB6osV0SQTLymcB4TgvyWu6ZyliaW0tI/otEQ=
+github.com/rogpeppe/go-internal v1.14.1/go.mod h1:MaRKkUm5W0goXpeCfT7UZI6fk/L7L7so1lCWt35ZSgc=
 github.com/sirupsen/logrus v1.9.3 h1:dueUQJ1C2q9oE3F7wvmSGAaVtTmUizReu6fjN8uqzbQ=
 github.com/sirupsen/logrus v1.9.3/go.mod h1:naHLuLoDiP4jHNo9R0sCBMtWGeIprob74mVsIT4qYEQ=
 github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
