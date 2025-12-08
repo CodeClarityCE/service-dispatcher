@@ -11,7 +11,7 @@ ARG PLUGINNAME
 WORKDIR /codeclarity/${KIND}/${PLUGINNAME}
 ADD .cloud/docker/config/* /root
 RUN apk add git
-RUN go install github.com/air-verse/air@v1.63.0
+RUN go install github.com/air-verse/air@v1.62.0
 CMD ["air", "-c", ".air.toml"]
 
 # DEBUG IMAGE
