@@ -1,49 +1,91 @@
 pipeline {
     agent { label 'codeclarity' }
 
-    environment {
-        DOCKERHUB_CREDENTIALS=credentials('dockerhub')
+    options {
+        timeout(time: 30, unit: 'MINUTES')
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
     }
-    stages {
-        stage('Login') {
 
-			steps {
-				sh 'echo $DOCKERHUB_CREDENTIALS_PSW | docker login -u $DOCKERHUB_CREDENTIALS_USR --password-stdin'
-			}
-		}
-        stage('Build') {
+    environment {
+        DOCKERHUB_CREDENTIALS = credentials('dockerhub')
+    }
+
+    stages {
+        stage('Setup') {
             steps {
-                sh 'docker system prune -af'
-                sh 'git submodule update --init --recursive'
-                sh 'git fetch --tags --force'
+                sh 'echo $DOCKERHUB_CREDENTIALS_PSW | docker login -u $DOCKERHUB_CREDENTIALS_USR --password-stdin'
                 script {
-                    def project =readJSON file: 'config.json'
-                    env.Version = project.version
-                    env.Name = project.image_name
-                    sh 'echo $Version'
-                    env.Tag = "${Name}:${Version.substring(1)}"
-                    sh 'echo $Tag'
-                    withCredentials(
-                        [
-                            file(credentialsId: 'netrc', variable: 'netrc'),
-                        ]
-                    ) {
-                        writeFile file: '.cloud/docker/config/.netrc', text: readFile(netrc)
-                    }
+                    def project = readJSON file: 'config.json'
+                    env.Version = project.version           // e.g., v0.0.15-alpha
+                    env.ImageName = project.image_name      // e.g., codeclarityce/service-dispatcher
+                    env.Tag = "${ImageName}:${Version.substring(1)}"  // Remove 'v' prefix for Docker tag
+                    echo "Version: ${Version}, Tag: ${Tag}"
                 }
-                sh 'docker buildx build -f .cloud/docker/Dockerfile --platform linux/amd64 --target plugin --tag codeclarityce/service-dispatcher:latest --tag $Tag .'
+                sh 'git submodule update --init --recursive'
+                sh 'git fetch --tags --force origin'
             }
         }
-        stage('Deploy') {
+
+        stage('PR Version Check') {
+            when {
+                expression { env.CHANGE_TARGET == 'main' }
+            }
             steps {
-                sh 'docker buildx rm plugin || true'
-                sh 'docker buildx create --name plugin --use --bootstrap'
                 script {
-                    def result = sh(script: "sh .cloud/jenkins/check_version.sh ${Version}", returnStatus: true)
-                    if (result == 0) {
-                        sh 'docker buildx build -f .cloud/docker/Dockerfile --platform linux/amd64,linux/arm64 --target plugin --tag codeclarityce/service-dispatcher:latest --tag $Tag --push .'
+                    def mainVersion = sh(
+                        script: "git show origin/main:config.json | jq -r '.version'",
+                        returnStdout: true
+                    ).trim()
+
+                    echo "PR Version: ${Version}"
+                    echo "Main Version: ${mainVersion}"
+
+                    if (Version == mainVersion) {
+                        error "Version not bumped! PR version (${Version}) equals main version (${mainVersion}). Please update config.json version."
+                    }
+                    echo "Version check passed: ${mainVersion} -> ${Version}"
+                }
+            }
+        }
+
+        stage('Build') {
+            when {
+                not { branch 'main' }
+            }
+            steps {
+                sh "docker build -f .cloud/docker/Dockerfile --target plugin --tag ${ImageName}:latest --tag ${Tag} ."
+            }
+        }
+
+        stage('Deploy') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    // Reuse existing builder or create new one
+                    sh 'docker buildx create --name builder --use --bootstrap 2>/dev/null || docker buildx use builder'
+
+                    // Build and push first (can be retried without side effects)
+                    sh "docker buildx build -f .cloud/docker/Dockerfile --platform linux/amd64,linux/arm64 --target plugin --tag ${ImageName}:latest --tag ${Tag} --push ."
+
+                    // Only create tag and release after successful push
+                    def tagExists = sh(script: "git tag -l '${Version}' | grep -q .", returnStatus: true) == 0
+                    if (!tagExists) {
+                        sh "gh release create '${Version}' --title 'Release ${Version}' --generate-notes --prerelease=\$(echo '${Version}' | grep -q 'alpha\\|beta' && echo true || echo false)"
                     }
                 }
+            }
+        }
+    }
+
+    post {
+        failure {
+            echo "Build failed for ${env.ImageName ?: 'unknown'}:${env.Tag ?: 'unknown'}"
+            node('codeclarity') {
+                sh 'docker buildx rm builder || true'
             }
         }
     }
