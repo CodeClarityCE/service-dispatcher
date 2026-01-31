@@ -223,8 +223,18 @@ func dispatch(connection string, d amqp.Delivery, dependencyResolver *Dependency
 			}
 		}
 
-		// If integration is set, send message to downloader_dispatcher
-		if integration_id != uuid.Nil {
+		// Query project to check its type
+		project_document := &codeclarity.Project{
+			Id: project_id,
+		}
+		err = db.NewSelect().Model(project_document).WherePK().Scan(ctx)
+		if err != nil {
+			log.Printf("Error fetching project: %v", err)
+			panic(err)
+		}
+
+		// Send to downloader for VCS projects (integration_id set) OR FILE projects
+		if integration_id != uuid.Nil || project_document.Type == "FILE" {
 			dispatcherMessage := types_amqp.DispatcherDownloaderMessage{
 				AnalysisId:     analysis_id,
 				ProjectId:      project_id,
@@ -234,7 +244,7 @@ func dispatch(connection string, d amqp.Delivery, dependencyResolver *Dependency
 
 			data, _ := json.Marshal(dispatcherMessage)
 
-			// Send message to downloader_dispatcher to download projects
+			// Send message to downloader_dispatcher to download/decompress projects
 			err = service.SendMessage("dispatcher_downloader", data)
 			if err != nil {
 				log.Printf("Failed to send message to dispatcher_downloader: %v", err)
