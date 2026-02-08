@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"log"
-	"time"
 
 	"github.com/CodeClarityCE/utility-boilerplates"
 	types_amqp "github.com/CodeClarityCE/utility-types/amqp"
@@ -14,6 +13,12 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/uptrace/bun"
 )
+
+// pendingMessage holds a message to be sent after DB commit
+type pendingMessage struct {
+	queueName string
+	data      []byte
+}
 
 // startPluginsWithDependencyResolution starts plugins in the given stage using dependency resolution
 func startPluginsWithDependencyResolution(analysis *codeclarity.Analysis, stageIndex int, organizationId uuid.UUID, config map[string]interface{}, db *bun.DB, dependencyResolver *DependencyResolver, service *boilerplates.ServiceBase) error {
@@ -43,9 +48,9 @@ func startPluginsWithDependencyResolution(analysis *codeclarity.Analysis, stageI
 
 	log.Printf("Starting %d plugins in dependency order: %v", len(sortedPlugins), getPluginNames(sortedPlugins))
 
-	// Start plugins in dependency order
+	// Phase A: Collect ready plugins and prepare messages in memory
+	var messages []pendingMessage
 	for stepId, step := range analysis.Steps[stageIndex] {
-		// Check if this plugin is in the ready list
 		for _, readyPlugin := range sortedPlugins {
 			if step.Name == readyPlugin.Name {
 				log.Printf("Starting plugin %s (dependency-resolved)", step.Name)
@@ -57,23 +62,31 @@ func startPluginsWithDependencyResolution(analysis *codeclarity.Analysis, stageI
 				}
 				data, _ := json.Marshal(dispatcherMessage)
 				analysis.Steps[stageIndex][stepId].Status = codeclarity.STARTED
-
-				err := db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
-					_, updateErr := tx.NewUpdate().Model(analysis).WherePK().Exec(ctx)
-					return updateErr
+				messages = append(messages, pendingMessage{
+					queueName: "dispatcher_" + step.Name,
+					data:      data,
 				})
-
-				if err != nil {
-					log.Printf("Error updating analysis for plugin %s: %v", step.Name, err)
-					return err
-				}
-
-				err = service.SendMessage("dispatcher_"+step.Name, data)
-				if err != nil {
-					log.Printf("Failed to send message to dispatcher_%s: %v", step.Name, err)
-				}
 				break
 			}
+		}
+	}
+
+	// Phase B: Single DB transaction for all status updates
+	if len(messages) > 0 {
+		err := db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
+			_, updateErr := tx.NewUpdate().Model(analysis).WherePK().Exec(ctx)
+			return updateErr
+		})
+		if err != nil {
+			log.Printf("Error updating analysis for stage %d: %v", stageIndex, err)
+			return err
+		}
+	}
+
+	// Phase C: Send all messages after DB commit
+	for _, msg := range messages {
+		if err := service.SendMessage(msg.queueName, msg.data); err != nil {
+			log.Printf("Failed to send message to %s: %v", msg.queueName, err)
 		}
 	}
 
@@ -86,6 +99,8 @@ func startAllPluginsInStage(analysis *codeclarity.Analysis, stageIndex int, orga
 
 	log.Printf("Starting all plugins in stage %d (no dependency resolution)", stageIndex)
 
+	// Phase A: Collect all plugins and prepare messages in memory
+	var messages []pendingMessage
 	for stepId, step := range analysis.Steps[stageIndex] {
 		log.Printf("Starting plugin %s (parallel mode)", step.Name)
 
@@ -96,20 +111,28 @@ func startAllPluginsInStage(analysis *codeclarity.Analysis, stageIndex int, orga
 		}
 		data, _ := json.Marshal(dispatcherMessage)
 		analysis.Steps[stageIndex][stepId].Status = codeclarity.STARTED
+		messages = append(messages, pendingMessage{
+			queueName: "dispatcher_" + step.Name,
+			data:      data,
+		})
+	}
 
+	// Phase B: Single DB transaction for all status updates
+	if len(messages) > 0 {
 		err := db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
 			_, updateErr := tx.NewUpdate().Model(analysis).WherePK().Exec(ctx)
 			return updateErr
 		})
-
 		if err != nil {
-			log.Printf("Error updating analysis for plugin %s: %v", step.Name, err)
+			log.Printf("Error updating analysis for stage %d: %v", stageIndex, err)
 			return err
 		}
+	}
 
-		err = service.SendMessage("dispatcher_"+step.Name, data)
-		if err != nil {
-			log.Printf("Failed to send message to dispatcher_%s: %v", step.Name, err)
+	// Phase C: Send all messages after DB commit
+	for _, msg := range messages {
+		if err := service.SendMessage(msg.queueName, msg.data); err != nil {
+			log.Printf("Failed to send message to %s: %v", msg.queueName, err)
 		}
 	}
 
@@ -313,15 +336,12 @@ func dispatch(connection string, d amqp.Delivery, dependencyResolver *Dependency
 			panic(err)
 		}
 
-		// SBOM can trigger an update of the DB
-		// Wait for analysis to finish updating db
-		for analysis_document.Status == codeclarity.UPDATING_DB {
-			time.Sleep(10 * time.Second)
-			log.Printf("Waiting for analysis to finish updating db")
-			err = db.NewSelect().Model(analysis_document).WherePK().Scan(ctx)
-			if err != nil {
-				panic(err)
-			}
+		// SBOM can trigger a knowledge DB update via packageFollower.
+		// Instead of polling, return immediately. The packageFollower will send
+		// a notification to plugins_dispatcher when done, re-triggering this handler.
+		if analysis_document.Status == codeclarity.UPDATING_DB {
+			log.Printf("Analysis %s is updating DB, will be re-triggered by packageFollower", analysis_document.Id)
+			return
 		}
 
 		// Check if stage completed
