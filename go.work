@@ -3,6 +3,7 @@ go 1.26.4
 toolchain go1.26.4
 
 use (
+	../../utilities/amqp-helper
 	../../utilities/boilerplates
 	../../utilities/db-helper
 	../../utilities/types
