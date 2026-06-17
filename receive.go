@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log"
+	"time"
 
 	"github.com/CodeClarityCE/utility-boilerplates"
 	types_amqp "github.com/CodeClarityCE/utility-types/amqp"
@@ -14,403 +16,445 @@ import (
 	"github.com/uptrace/bun"
 )
 
-// pendingMessage holds a message to be sent after DB commit
+// pendingMessage holds a message to be published AFTER the DB transaction commits.
+// We never publish while holding a row lock — mirror plugin_base.go which commits
+// its step update before notifying the dispatcher.
 type pendingMessage struct {
 	queueName string
 	data      []byte
 }
 
-// startPluginsWithDependencyResolution starts plugins in the given stage using dependency resolution
-func startPluginsWithDependencyResolution(analysis *codeclarity.Analysis, stageIndex int, organizationId uuid.UUID, config map[string]interface{}, db *bun.DB, dependencyResolver *DependencyResolver, service *boilerplates.ServiceBase) error {
-	ctx := context.Background()
-
-	if dependencyResolver == nil {
-		log.Printf("Warning: Dependency resolver not initialized, falling back to parallel execution")
-		return startAllPluginsInStage(analysis, stageIndex, organizationId, config, db, service)
-	}
-
-	log.Printf("Starting stage %d with dependency resolution", stageIndex)
-
-	// Get plugins that are ready to run (dependencies satisfied)
-	readyPlugins, err := dependencyResolver.GetReadyPlugins(analysis, stageIndex)
-	if err != nil {
-		log.Printf("Error getting ready plugins: %v", err)
-		return startAllPluginsInStage(analysis, stageIndex, organizationId, config, db, service)
-	}
-
-	if len(readyPlugins) == 0 {
-		log.Printf("No plugins ready to run in stage %d", stageIndex)
-		return nil
-	}
-
-	// Sort plugins topologically within the ready set
-	sortedPlugins := dependencyResolver.TopologicalSort(readyPlugins)
-
-	log.Printf("Starting %d plugins in dependency order: %v", len(sortedPlugins), getPluginNames(sortedPlugins))
-
-	// Phase A: Collect ready plugins and prepare messages in memory
-	var messages []pendingMessage
-	for stepId, step := range analysis.Steps[stageIndex] {
-		for _, readyPlugin := range sortedPlugins {
-			if step.Name == readyPlugin.Name {
-				log.Printf("Starting plugin %s (dependency-resolved)", step.Name)
-
-				dispatcherMessage := types_amqp.DispatcherPluginMessage{
-					AnalysisId:     analysis.Id,
-					OrganizationId: organizationId,
-					Data:           config,
-				}
-				data, _ := json.Marshal(dispatcherMessage)
-				analysis.Steps[stageIndex][stepId].Status = codeclarity.STARTED
-				messages = append(messages, pendingMessage{
-					queueName: "dispatcher_" + step.Name,
-					data:      data,
-				})
-				break
-			}
+// evaluateStage reports the terminal state of a stage's steps.
+//   - anyFailure is true if any step failed.
+//   - allSuccess is true if every step succeeded (vacuously true for an empty stage).
+func evaluateStage(steps []codeclarity.Step) (anyFailure bool, allSuccess bool) {
+	allSuccess = true
+	for _, step := range steps {
+		if step.Status == codeclarity.FAILURE {
+			anyFailure = true
+		}
+		if step.Status != codeclarity.SUCCESS {
+			allSuccess = false
 		}
 	}
-
-	// Phase B: Single DB transaction for all status updates
-	if len(messages) > 0 {
-		err := db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
-			_, updateErr := tx.NewUpdate().Model(analysis).WherePK().Exec(ctx)
-			return updateErr
-		})
-		if err != nil {
-			log.Printf("Error updating analysis for stage %d: %v", stageIndex, err)
-			return err
-		}
-	}
-
-	// Phase C: Send all messages after DB commit
-	for _, msg := range messages {
-		if err := service.SendMessage(msg.queueName, msg.data); err != nil {
-			log.Printf("Failed to send message to %s: %v", msg.queueName, err)
-		}
-	}
-
-	return nil
+	return anyFailure, allSuccess
 }
 
-// startAllPluginsInStage starts all plugins in a stage without dependency resolution (fallback)
-func startAllPluginsInStage(analysis *codeclarity.Analysis, stageIndex int, organizationId uuid.UUID, config map[string]interface{}, db *bun.DB, service *boilerplates.ServiceBase) error {
-	ctx := context.Background()
+// reclaimStuckSteps clears STARTED steps whose dispatch is assumed lost — those
+// STARTED for longer than reclaimAfter (publish failure or a dead plugin). It is
+// pure: it mutates only doc.Steps and returns what the caller must persist.
+//
+//   - failStageZero is true if a stuck step is in stage 0; the caller fails the
+//     analysis because js-sbom cannot be safely re-run (it needs source on disk).
+//   - dirty is true if any later-stage step was reset (status/Started_on cleared)
+//     so the dispatch loop will re-send it.
+//
+// reclaimAfter <= 0 disables reclaim entirely (the live, non-reaper callers).
+func reclaimStuckSteps(doc *codeclarity.Analysis, now time.Time, reclaimAfter time.Duration) (failStageZero, dirty bool) {
+	if reclaimAfter <= 0 {
+		return false, false
+	}
+	for s := range doc.Steps {
+		for i := range doc.Steps[s] {
+			st := &doc.Steps[s][i]
+			if st.Status != codeclarity.STARTED {
+				continue
+			}
+			started, perr := time.Parse(time.RFC3339Nano, st.Started_on)
+			if perr != nil || now.Sub(started) < reclaimAfter {
+				continue
+			}
+			if s == 0 {
+				return true, dirty
+			}
+			st.Status = ""
+			st.Started_on = ""
+			dirty = true
+		}
+	}
+	return false, dirty
+}
 
-	log.Printf("Starting all plugins in stage %d (no dependency resolution)", stageIndex)
+// stageReadyPlugins mutates the in-memory analysis (setting ready, not-yet-started
+// plugins in the given stage to STARTED) and returns the dispatcher messages that
+// should be published once the surrounding transaction commits.
+//
+// It is purely in-memory: the caller is responsible for persisting `analysis`
+// inside its locked transaction and for publishing the returned messages after
+// commit. Steps whose status is non-empty are skipped, which makes the whole
+// operation idempotent — re-running it never double-dispatches a plugin.
+func stageReadyPlugins(analysis *codeclarity.Analysis, stageIndex int, dr *DependencyResolver) ([]pendingMessage, bool) {
+	if stageIndex < 0 || stageIndex >= len(analysis.Steps) {
+		return nil, false
+	}
 
-	// Phase A: Collect all plugins and prepare messages in memory
-	var messages []pendingMessage
-	for stepId, step := range analysis.Steps[stageIndex] {
-		log.Printf("Starting plugin %s (parallel mode)", step.Name)
+	var ready []codeclarity.Step
+	if dr != nil {
+		r, err := dr.GetReadyPlugins(analysis, stageIndex)
+		if err != nil {
+			log.Printf("GetReadyPlugins(stage %d) failed, falling back to all-in-stage: %v", stageIndex, err)
+			r = analysis.Steps[stageIndex]
+		}
+		ready = dr.TopologicalSort(r)
+	} else {
+		ready = analysis.Steps[stageIndex]
+	}
+
+	readySet := make(map[string]bool, len(ready))
+	for _, s := range ready {
+		readySet[s.Name] = true
+	}
+
+	var msgs []pendingMessage
+	staged := false
+	for stepId := range analysis.Steps[stageIndex] {
+		step := analysis.Steps[stageIndex][stepId]
+		// Only dispatch plugins that haven't started yet and are ready.
+		if step.Status != "" || !readySet[step.Name] {
+			continue
+		}
 
 		dispatcherMessage := types_amqp.DispatcherPluginMessage{
 			AnalysisId:     analysis.Id,
-			OrganizationId: organizationId,
-			Data:           config,
+			OrganizationId: analysis.OrganizationId,
+			Data:           analysis.Config,
 		}
 		data, _ := json.Marshal(dispatcherMessage)
 		analysis.Steps[stageIndex][stepId].Status = codeclarity.STARTED
-		messages = append(messages, pendingMessage{
-			queueName: "dispatcher_" + step.Name,
-			data:      data,
-		})
+		// Stamp the dispatch time so the reaper can age a STARTED step and reclaim
+		// it if its dispatch was lost (the plugin sets its own Started_on on run).
+		analysis.Steps[stageIndex][stepId].Started_on = time.Now().Format(time.RFC3339Nano)
+		msgs = append(msgs, pendingMessage{queueName: "dispatcher_" + step.Name, data: data})
+		staged = true
 	}
-
-	// Phase B: Single DB transaction for all status updates
-	if len(messages) > 0 {
-		err := db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
-			_, updateErr := tx.NewUpdate().Model(analysis).WherePK().Exec(ctx)
-			return updateErr
-		})
-		if err != nil {
-			log.Printf("Error updating analysis for stage %d: %v", stageIndex, err)
-			return err
-		}
-	}
-
-	// Phase C: Send all messages after DB commit
-	for _, msg := range messages {
-		if err := service.SendMessage(msg.queueName, msg.data); err != nil {
-			log.Printf("Failed to send message to %s: %v", msg.queueName, err)
-		}
-	}
-
-	return nil
+	return msgs, staged
 }
 
-// getPluginNames extracts plugin names from steps for logging
-func getPluginNames(steps []codeclarity.Step) []string {
-	names := make([]string, len(steps))
-	for i, step := range steps {
-		names[i] = step.Name
+// finalizeOrAdvanceStage atomically reconciles a single analysis. Within one
+// transaction it re-reads the row under a `FOR UPDATE` lock and then, based on
+// the freshly-locked step statuses:
+//
+//   - sets FAILURE if any step in the current stage failed;
+//   - sets COMPLETED if the last stage is fully successful;
+//   - advances the stage if the current stage is complete; and/or
+//   - (when allowStaging) dispatches any not-yet-started, dependency-satisfied
+//     plugins across stages 0..Stage (this covers the very first dispatch, the
+//     newly advanced stage, and plugins whose dependencies just became ready).
+//
+// It is fully idempotent: terminal analyses are a no-op, and already-started
+// plugins are never re-dispatched. The SAME function backs the live message
+// handlers and the reaper, so a reaper run racing a live completion is safe —
+// whoever wins the row lock makes the transition; the other observes the
+// terminal/started state and does nothing.
+//
+// Returned messages MUST be published by the caller after this returns (the
+// transaction has already committed); we never publish under the lock.
+//
+// allowStageZeroStart gates (re-)dispatch of stage 0. Stage 0 (js-sbom) reads
+// the project source from disk, which is only guaranteed present after the
+// downloader has run. The live api_request/downloader paths pass true; the
+// reaper passes false so it never re-runs js-sbom against missing source (doing
+// so would falsely fail the analysis). Later stages read the SBOM from the DB
+// and are always safe to (re)dispatch for lost-message recovery.
+//
+// reclaimAfter (reaper-only; live callers pass 0) recovers a *lost dispatch*: a
+// step left STARTED for longer than reclaimAfter is assumed dead (publish failure
+// or a crashed plugin). Later-stage steps are reset to "" so the dispatch loop
+// re-sends them; a stuck stage-0 step can't be safely re-run, so the analysis is
+// failed instead of hung.
+//
+// It returns an outcome describing the transition made ("completed", "failure",
+// "advanced", "dispatched", or "" for no-op) so callers (the reaper) can log it.
+func finalizeOrAdvanceStage(analysisId uuid.UUID, db *bun.DB, dr *DependencyResolver, allowStageZeroStart bool, reclaimAfter time.Duration) ([]pendingMessage, string, error) {
+	ctx := context.Background()
+	var messages []pendingMessage
+	outcome := ""
+
+	err := db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
+		doc := &codeclarity.Analysis{Id: analysisId}
+		if e := tx.NewSelect().Model(doc).WherePK().For("UPDATE").Scan(ctx); e != nil {
+			return fmt.Errorf("lock+reload analysis %s: %w", analysisId, e)
+		}
+
+		// Idempotency / transient guards.
+		switch doc.Status {
+		case codeclarity.COMPLETED, codeclarity.FAILURE:
+			return nil // already terminal
+		case codeclarity.UPDATING_DB:
+			return nil // packageFollower will re-trigger when the DB update completes
+		}
+		if len(doc.Steps) == 0 {
+			return nil
+		}
+
+		// The stage counter already advanced past the last stage but the status
+		// was never finalized (a lost COMPLETED/FAILURE write — the original race).
+		// Finalize from the terminal step states across all stages.
+		if doc.Stage >= len(doc.Steps) {
+			anyFailure := false
+			for _, stg := range doc.Steps {
+				if af, _ := evaluateStage(stg); af {
+					anyFailure = true
+				}
+			}
+			if anyFailure {
+				doc.Status = codeclarity.FAILURE
+				outcome = "failure"
+			} else {
+				doc.Status = codeclarity.COMPLETED
+				outcome = "completed"
+			}
+			if _, e := tx.NewUpdate().Model(doc).WherePK().Exec(ctx); e != nil {
+				return e
+			}
+			return nil
+		}
+
+		dirty := false
+
+		// Reaper-only: reclaim STARTED steps whose dispatch was lost. A stuck
+		// stage-0 step can't be safely re-run (js-sbom needs the source on disk)
+		// so the analysis is failed; later-stage steps are reset so the dispatch
+		// loop re-sends them.
+		if failStageZero, reclaimed := reclaimStuckSteps(doc, time.Now(), reclaimAfter); failStageZero {
+			doc.Status = codeclarity.FAILURE
+			outcome = "failure"
+			if _, e := tx.NewUpdate().Model(doc).WherePK().Exec(ctx); e != nil {
+				return e
+			}
+			return nil
+		} else if reclaimed {
+			dirty = true
+		}
+
+		// Evaluate the current stage from the locked snapshot.
+		if doc.Stage >= 0 && doc.Stage < len(doc.Steps) {
+			anyFailure, allSuccess := evaluateStage(doc.Steps[doc.Stage])
+			switch {
+			case anyFailure:
+				doc.Status = codeclarity.FAILURE
+				outcome = "failure"
+				if _, e := tx.NewUpdate().Model(doc).WherePK().Exec(ctx); e != nil {
+					return e
+				}
+				return nil
+			case allSuccess:
+				doc.Stage++
+				dirty = true
+				if doc.Stage == len(doc.Steps) {
+					doc.Status = codeclarity.COMPLETED
+					outcome = "completed"
+					if _, e := tx.NewUpdate().Model(doc).WherePK().Exec(ctx); e != nil {
+						return e
+					}
+					return nil
+				}
+			}
+		}
+
+		// Dispatch any plugins that are now ready.
+		maxStage := doc.Stage
+		if maxStage > len(doc.Steps)-1 {
+			maxStage = len(doc.Steps) - 1
+		}
+		for s := 0; s <= maxStage; s++ {
+			// Never re-initiate stage 0 from a context that can't guarantee the
+			// source is on disk (the reaper). That path belongs to the downloader.
+			if s == 0 && !allowStageZeroStart {
+				continue
+			}
+			msgs, staged := stageReadyPlugins(doc, s, dr)
+			if staged {
+				dirty = true
+			}
+			messages = append(messages, msgs...)
+		}
+
+		if dirty {
+			if _, e := tx.NewUpdate().Model(doc).WherePK().Exec(ctx); e != nil {
+				return e
+			}
+		}
+		switch {
+		case len(messages) > 0:
+			outcome = "dispatched"
+		case dirty:
+			outcome = "advanced"
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, "", err
 	}
-	return names
+	return messages, outcome, nil
 }
 
-// dispatch is a function that handles the dispatching of messages based on the connection type.
-// It takes a connection string and an amqp.Delivery object as parameters.
-// If the connection is "api_request", it reads the message from the API, opens the database,
-// retrieves the analysis and analyzer documents, initializes the analysis, and sends a message
-// to the downloader_dispatcher to download projects.
-// If the connection is "downloader_dispatcher", it reads the message from the API, opens the database,
-// retrieves the analysis document, starts each plugin in step 0 by sending a message to the dispatcher_plugin,
-// and updates the analysis document accordingly.
-// If the connection is "plugins_dispatcher", it reads the message, opens the database,
-// retrieves the analysis document, checks if the current stage is completed, and if so,
-// goes to the next stage and starts each plugin in the new stage by sending a message to the dispatcher_plugin.
-// The function also handles error logging and transaction commits.
+// sendMessages publishes the post-commit messages, logging (not failing) on error.
+// A dropped message is recovered by the reaper, so a transient publish failure
+// must not panic the consumer.
+func sendMessages(service *boilerplates.ServiceBase, msgs []pendingMessage) {
+	for _, m := range msgs {
+		if err := service.SendMessage(m.queueName, m.data); err != nil {
+			log.Printf("Failed to send message to %s: %v", m.queueName, err)
+		}
+	}
+}
+
+// dispatch routes an incoming message based on its source queue.
+//
+//   - api_request: initialize the analysis (copy the analyzer's step plan) and
+//     either hand off to the downloader (VCS / FILE projects) or start stage 0.
+//   - downloader_dispatcher: the source is downloaded — start stage 0.
+//   - plugins_dispatcher: a plugin finished — finalize/advance the analysis.
+//
+// All branches use log-and-return on errors rather than panic(): a panic is
+// recovered by the consumer loop and the message requeued, so a deterministically
+// failing ("poison") message would otherwise loop forever and starve the queue's
+// single consumer. Dropping the message is safe because the reaper reconciles any
+// analysis left in a non-terminal state.
 func dispatch(connection string, d amqp.Delivery, dependencyResolver *DependencyResolver, service *boilerplates.ServiceBase) {
-	if connection == "api_request" { // If message is from api_request
-		// Read message from API - handle both string and UUID formats
-		var rawMessage map[string]interface{}
-		json.Unmarshal([]byte(d.Body), &rawMessage)
+	switch connection {
+	case "api_request":
+		dispatchAPIRequest(d, dependencyResolver, service)
+	case "downloader_dispatcher":
+		dispatchDownloaderResult(d, dependencyResolver, service)
+	case "plugins_dispatcher":
+		dispatchPluginResult(d, dependencyResolver, service)
+	default:
+		log.Printf("[dispatch] unknown connection %q, dropping message", connection)
+	}
+}
 
-		// Debug: print the entire message to see what we're receiving
-		log.Printf("Debug: Received message: %+v", rawMessage)
+func dispatchAPIRequest(d amqp.Delivery, dependencyResolver *DependencyResolver, service *boilerplates.ServiceBase) {
+	var rawMessage map[string]any
+	if err := json.Unmarshal(d.Body, &rawMessage); err != nil {
+		log.Printf("[dispatch:api_request] bad message, dropping: %v", err)
+		return
+	}
+	log.Printf("[dispatch:api_request] received: %+v", rawMessage)
 
-		// Parse analysis_id as string first, then convert to UUID
-		analysis_id_str, ok := rawMessage["analysis_id"].(string)
-		if !ok {
-			log.Printf("Error: analysis_id is not a string, got: %T %+v", rawMessage["analysis_id"], rawMessage["analysis_id"])
-			return
-		}
-		analysis_id, err := uuid.Parse(analysis_id_str)
-		if err != nil {
-			log.Printf("Error parsing analysis_id: %v", err)
-			return
-		}
+	analysisIdStr, ok := rawMessage["analysis_id"].(string)
+	if !ok {
+		log.Printf("[dispatch:api_request] analysis_id not a string (%T), dropping", rawMessage["analysis_id"])
+		return
+	}
+	analysisId, err := uuid.Parse(analysisIdStr)
+	if err != nil {
+		log.Printf("[dispatch:api_request] bad analysis_id %q, dropping: %v", analysisIdStr, err)
+		return
+	}
 
-		db := service.DB.CodeClarity
+	projectIdStr, ok := rawMessage["project_id"].(string)
+	if !ok {
+		log.Printf("[dispatch:api_request] project_id not a string (%T), dropping", rawMessage["project_id"])
+		return
+	}
+	projectId, err := uuid.Parse(projectIdStr)
+	if err != nil {
+		log.Printf("[dispatch:api_request] bad project_id %q, dropping: %v", projectIdStr, err)
+		return
+	}
 
-		analysis_document := &codeclarity.Analysis{
-			Id: analysis_id,
-		}
+	organizationIdStr, ok := rawMessage["organization_id"].(string)
+	if !ok {
+		log.Printf("[dispatch:api_request] organization_id not a string, dropping")
+		return
+	}
+	organizationId, err := uuid.Parse(organizationIdStr)
+	if err != nil {
+		log.Printf("[dispatch:api_request] bad organization_id %q, dropping: %v", organizationIdStr, err)
+		return
+	}
 
-		ctx := context.Background()
-		err = db.NewSelect().Model(analysis_document).WherePK().Scan(ctx)
-		if err != nil {
-			panic(err)
-		}
-
-		analyzer_document := &codeclarity.Analyzer{
-			Id: analysis_document.AnalyzerId,
-		}
-		err = db.NewSelect().Model(analyzer_document).WherePK().Scan(ctx)
-		if err != nil {
-			panic(err)
-		}
-
-		// Initialize analysis
-		analysis_document.Stage = 0
-		analysis_document.Steps = analyzer_document.Steps
-		analysis_document.Status = codeclarity.STARTED
-		_, err = db.NewUpdate().Model(analysis_document).WherePK().Exec(ctx)
-
-		if err != nil {
-			panic(err)
-		}
-
-		// Parse other required fields from raw message
-		project_id_str, ok := rawMessage["project_id"].(string)
-		if !ok {
-			log.Printf("Error: project_id is not a string, got: %T %+v", rawMessage["project_id"], rawMessage["project_id"])
-			return
-		}
-		project_id, err := uuid.Parse(project_id_str)
-		if err != nil {
-			log.Printf("Error parsing project_id: %v", err)
-			return
-		}
-
-		organization_id_str, ok := rawMessage["organization_id"].(string)
-		if !ok {
-			log.Printf("Error: organization_id is not a string")
-			return
-		}
-		organization_id, err := uuid.Parse(organization_id_str)
-		if err != nil {
-			log.Printf("Error parsing organization_id: %v", err)
-			return
-		}
-
-		// Parse integration_id (can be null)
-		var integration_id uuid.UUID
-		if integration_id_raw := rawMessage["integration_id"]; integration_id_raw != nil {
-			if integration_id_str, ok := integration_id_raw.(string); ok && integration_id_str != "" {
-				integration_id, err = uuid.Parse(integration_id_str)
-				if err != nil {
-					log.Printf("Error parsing integration_id: %v", err)
-					return
-				}
-			}
-		}
-
-		// Query project to check its type
-		project_document := &codeclarity.Project{
-			Id: project_id,
-		}
-		err = db.NewSelect().Model(project_document).WherePK().Scan(ctx)
-		if err != nil {
-			log.Printf("Error fetching project: %v", err)
-			panic(err)
-		}
-
-		// Send to downloader for VCS projects (integration_id set) OR FILE projects
-		if integration_id != uuid.Nil || project_document.Type == "FILE" {
-			dispatcherMessage := types_amqp.DispatcherDownloaderMessage{
-				AnalysisId:     analysis_id,
-				ProjectId:      project_id,
-				IntegrationId:  integration_id,
-				OrganizationId: organization_id,
-			}
-
-			data, _ := json.Marshal(dispatcherMessage)
-
-			// Send message to downloader_dispatcher to download/decompress projects
-			err = service.SendMessage("dispatcher_downloader", data)
+	var integrationId uuid.UUID
+	if raw := rawMessage["integration_id"]; raw != nil {
+		if s, ok := raw.(string); ok && s != "" {
+			integrationId, err = uuid.Parse(s)
 			if err != nil {
-				log.Printf("Failed to send message to dispatcher_downloader: %v", err)
-			}
-		} else {
-			// Parse config from raw message
-			var config map[string]interface{}
-			if configRaw := rawMessage["config"]; configRaw != nil {
-				config, _ = configRaw.(map[string]interface{})
-			}
-
-			// Start plugins with dependency resolution
-			err = startPluginsWithDependencyResolution(analysis_document, 0, organization_id, config, db, dependencyResolver, service)
-			if err != nil {
-				log.Printf("Error starting plugins in stage 0: %v", err)
-				panic(err)
-			}
-		}
-
-	} else if connection == "downloader_dispatcher" { // If message is from api_request
-		// Read message from API
-		var apiMessage types_amqp.DownloaderDispatcherMessage
-		json.Unmarshal([]byte(d.Body), &apiMessage)
-		analysis_id := apiMessage.AnalysisId
-
-		db := service.DB.CodeClarity
-		// Get analysis
-		analysis_document := &codeclarity.Analysis{
-			Id: analysis_id,
-		}
-		ctx := context.Background()
-		err := db.NewSelect().Model(analysis_document).WherePK().Scan(ctx)
-		if err != nil {
-			panic(err)
-		}
-
-		// Start plugins with dependency resolution
-		err = startPluginsWithDependencyResolution(analysis_document, 0, apiMessage.OrganizationId, nil, db, dependencyResolver, service)
-		if err != nil {
-			log.Printf("Error starting plugins in stage 0: %v", err)
-			panic(err)
-		}
-
-		// Commit transaction
-		// err = db.CommitTransaction(tctx, trxid, nil)
-		// if err != nil {
-		// 	log.Printf("Failed to commit transaction: %t", err)
-		// 	return
-		// }
-
-	} else if connection == "plugins_dispatcher" { // If message is from sbom_dispatcher
-		// Read message
-		var pluginMessage types_amqp.PluginDispatcherMessage
-		json.Unmarshal([]byte(d.Body), &pluginMessage)
-
-		// Open DB
-		db := service.DB.CodeClarity
-
-		// Get analysis
-		analysis_document := &codeclarity.Analysis{
-			Id: pluginMessage.AnalysisId,
-		}
-		ctx := context.Background()
-		err := db.NewSelect().Model(analysis_document).WherePK().Scan(ctx)
-		if err != nil {
-			panic(err)
-		}
-
-		// SBOM can trigger a knowledge DB update via packageFollower.
-		// Instead of polling, return immediately. The packageFollower will send
-		// a notification to plugins_dispatcher when done, re-triggering this handler.
-		if analysis_document.Status == codeclarity.UPDATING_DB {
-			log.Printf("Analysis %s is updating DB, will be re-triggered by packageFollower", analysis_document.Id)
-			return
-		}
-
-		// Check if stage completed
-		stage_completed := true
-		if analysis_document.Stage > len(analysis_document.Steps)-1 {
-			return
-		}
-		for step_id := range analysis_document.Steps[analysis_document.Stage] {
-			// Check if all steps are completed
-			if analysis_document.Steps[analysis_document.Stage][step_id].Status != codeclarity.SUCCESS {
-				stage_completed = false
-			}
-			if analysis_document.Steps[analysis_document.Stage][step_id].Status == codeclarity.FAILURE {
-				analysis_document.Status = codeclarity.FAILURE
-				_, err = db.NewUpdate().Model(analysis_document).WherePK().Exec(ctx)
-				if err != nil {
-					panic(err)
-				}
-				// // Commit transaction
-				// err = db.CommitTransaction(tctx, trxid, nil)
-				// if err != nil {
-				// 	log.Printf("Failed to commit transaction: %t", err)
-				// 	return
-				// }
+				log.Printf("[dispatch:api_request] bad integration_id %q, dropping: %v", s, err)
 				return
 			}
 		}
-		// If stage completed, go to next stage
-		if stage_completed {
-			// Increment stage
-			analysis_document.Stage++
-			if analysis_document.Stage == len(analysis_document.Steps) {
-				// Analysis completed
-				analysis_document.Status = codeclarity.COMPLETED
-				_, err = db.NewUpdate().Model(analysis_document).WherePK().Exec(ctx)
-				if err != nil {
-					panic(err)
-				}
-			} else {
-				// Start plugins with dependency resolution for the next stage
-				err = startPluginsWithDependencyResolution(analysis_document, analysis_document.Stage, analysis_document.OrganizationId, nil, db, dependencyResolver, service)
-				if err != nil {
-					log.Printf("Error starting plugins in stage %d: %v", analysis_document.Stage, err)
-					panic(err)
-				}
-			}
-		}
-
-		// Check if there are any plugins in the current or previous stages that might now be ready to run
-		if dependencyResolver != nil && dependencyResolver.HasPendingDependentPlugins(analysis_document) {
-			log.Printf("Found plugins with satisfied dependencies, checking all stages for ready plugins")
-
-			// Check all stages for plugins that might now be ready
-			for stageIndex := 0; stageIndex <= analysis_document.Stage && stageIndex < len(analysis_document.Steps); stageIndex++ {
-				readyPlugins, err := dependencyResolver.GetReadyPlugins(analysis_document, stageIndex)
-				if err != nil {
-					log.Printf("Error checking ready plugins in stage %d: %v", stageIndex, err)
-					continue
-				}
-
-				if len(readyPlugins) > 0 {
-					log.Printf("Starting %d newly ready plugins in stage %d", len(readyPlugins), stageIndex)
-					err = startPluginsWithDependencyResolution(analysis_document, stageIndex, analysis_document.OrganizationId, nil, db, dependencyResolver, service)
-					if err != nil {
-						log.Printf("Error starting ready plugins in stage %d: %v", stageIndex, err)
-					}
-				}
-			}
-		}
-
 	}
+
+	db := service.DB.CodeClarity
+	ctx := context.Background()
+
+	// Initialize the analysis from its analyzer's step plan under a row lock.
+	analysisDocument := &codeclarity.Analysis{Id: analysisId}
+	err = db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
+		if e := tx.NewSelect().Model(analysisDocument).WherePK().For("UPDATE").Scan(ctx); e != nil {
+			return fmt.Errorf("load analysis: %w", e)
+		}
+		analyzerDocument := &codeclarity.Analyzer{Id: analysisDocument.AnalyzerId}
+		if e := tx.NewSelect().Model(analyzerDocument).WherePK().Scan(ctx); e != nil {
+			return fmt.Errorf("load analyzer: %w", e)
+		}
+		analysisDocument.Stage = 0
+		analysisDocument.Steps = analyzerDocument.Steps
+		analysisDocument.Status = codeclarity.STARTED
+		_, e := tx.NewUpdate().Model(analysisDocument).WherePK().Exec(ctx)
+		return e
+	})
+	if err != nil {
+		log.Printf("[dispatch:api_request] init failed for %s, dropping: %v", analysisId, err)
+		return
+	}
+
+	// VCS (integration set) and FILE projects must be downloaded first.
+	projectDocument := &codeclarity.Project{Id: projectId}
+	if e := db.NewSelect().Model(projectDocument).WherePK().Scan(ctx); e != nil {
+		log.Printf("[dispatch:api_request] load project %s failed for %s, dropping: %v", projectId, analysisId, e)
+		return
+	}
+
+	if integrationId != uuid.Nil || projectDocument.Type == "FILE" {
+		downloaderMessage := types_amqp.DispatcherDownloaderMessage{
+			AnalysisId:     analysisId,
+			ProjectId:      projectId,
+			IntegrationId:  integrationId,
+			OrganizationId: organizationId,
+		}
+		data, _ := json.Marshal(downloaderMessage)
+		if e := service.SendMessage("dispatcher_downloader", data); e != nil {
+			log.Printf("[dispatch:api_request] failed to send to dispatcher_downloader: %v", e)
+		}
+		return
+	}
+
+	// No download needed — start stage 0 directly.
+	msgs, _, e := finalizeOrAdvanceStage(analysisId, db, dependencyResolver, true, 0)
+	if e != nil {
+		log.Printf("[dispatch:api_request] stage-0 start failed for %s, dropping (reaper will retry): %v", analysisId, e)
+		return
+	}
+	sendMessages(service, msgs)
+}
+
+func dispatchDownloaderResult(d amqp.Delivery, dependencyResolver *DependencyResolver, service *boilerplates.ServiceBase) {
+	var msg types_amqp.DownloaderDispatcherMessage
+	if err := json.Unmarshal(d.Body, &msg); err != nil {
+		log.Printf("[dispatch:downloader_dispatcher] bad message, dropping: %v", err)
+		return
+	}
+	msgs, _, err := finalizeOrAdvanceStage(msg.AnalysisId, service.DB.CodeClarity, dependencyResolver, true, 0)
+	if err != nil {
+		log.Printf("[dispatch:downloader_dispatcher] stage-0 start failed for %s, dropping (reaper will retry): %v", msg.AnalysisId, err)
+		return
+	}
+	sendMessages(service, msgs)
+}
+
+func dispatchPluginResult(d amqp.Delivery, dependencyResolver *DependencyResolver, service *boilerplates.ServiceBase) {
+	var msg types_amqp.PluginDispatcherMessage
+	if err := json.Unmarshal(d.Body, &msg); err != nil {
+		log.Printf("[dispatch:plugins_dispatcher] bad message, dropping: %v", err)
+		return
+	}
+	msgs, _, err := finalizeOrAdvanceStage(msg.AnalysisId, service.DB.CodeClarity, dependencyResolver, true, 0)
+	if err != nil {
+		log.Printf("[dispatch:plugins_dispatcher] finalize failed for %s, dropping (reaper will retry): %v", msg.AnalysisId, err)
+		return
+	}
+	sendMessages(service, msgs)
 }
