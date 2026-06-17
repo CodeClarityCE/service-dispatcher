@@ -178,7 +178,7 @@ func finalizeOrAdvanceStage(analysisId uuid.UUID, db *bun.DB, dr *DependencyReso
 
 		// Idempotency / transient guards.
 		switch doc.Status {
-		case codeclarity.COMPLETED, codeclarity.FAILURE:
+		case codeclarity.COMPLETED, codeclarity.FAILURE, codeclarity.CANCELLED:
 			return nil // already terminal
 		case codeclarity.UPDATING_DB:
 			return nil // packageFollower will re-trigger when the DB update completes
