@@ -35,6 +35,13 @@ const (
 	// Backstop on the per-analysis reconcile loop (heals several lost-completion
 	// stages in one pass); far above any real stage count.
 	maxReapIterations = 32
+
+	// Non-terminal analyses older than this are retired (marked FAILURE) instead of
+	// recovered. No real analysis runs this long, so such rows are abandoned/broken;
+	// re-driving them on every restart would re-download thousands of stale repos
+	// forever. Must be generously larger than any real end-to-end analysis time.
+	defaultRecoveryMaxAge = 24 * time.Hour
+	envRecoveryMaxAge     = "RECOVERY_MAX_AGE" // seconds
 )
 
 // envDurationSeconds reads an env var as a positive number of seconds, falling
@@ -60,10 +67,22 @@ func stepStuckTimeout() time.Duration {
 	return envDurationSeconds(envStepStuckTimeout, defaultStepStuckTimeout)
 }
 
-// runReaper loops forever, reconciling stuck analyses once per interval.
+// recoveryMaxAge returns the age past which a non-terminal analysis is retired
+// rather than recovered, overridable via RECOVERY_MAX_AGE.
+func recoveryMaxAge() time.Duration {
+	return envDurationSeconds(envRecoveryMaxAge, defaultRecoveryMaxAge)
+}
+
+// runReaper recovers orphaned analyses on startup, then loops forever reconciling
+// stuck analyses once per interval. The startup pass exists because `make down`
+// wipes the (volume-less dev) RabbitMQ queue: every in-flight message is lost
+// while the Postgres analysis rows survive, so on boot every non-terminal analysis
+// is orphaned and must be re-driven from DB state.
 func runReaper(db *bun.DB, dr *DependencyResolver, service *boilerplates.ServiceBase) {
 	interval := reaperInterval()
 	log.Printf("[reaper] started: interval=%s", interval)
+
+	recoverOnStartup(db, dr, service)
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -72,18 +91,9 @@ func runReaper(db *bun.DB, dr *DependencyResolver, service *boilerplates.Service
 	}
 }
 
-// reapOnce finds every non-terminal analysis and reconciles each. The finalizer
-// takes a row lock, so a reaper pass that races a live completion is safe — one
-// wins the lock and transitions, the other no-ops.
-//
-// The reaper passes allowStageZeroStart=false: it never re-runs js-sbom (stage 0)
-// because it cannot guarantee the project source is on disk. It completes
-// all-success analyses, fails failed ones, advances stages whose completion was
-// lost, and reclaims later-stage steps whose dispatch was lost (see
-// stepStuckTimeout). A stuck stage-0 step is failed rather than re-run.
-func reapOnce(db *bun.DB, dr *DependencyResolver, service *boilerplates.ServiceBase) {
-	ctx := context.Background()
-
+// nonTerminalAnalyses returns the ids of every analysis still in a STARTED/ONGOING
+// state — the only ones that can be orphaned or stuck.
+func nonTerminalAnalyses(ctx context.Context, db *bun.DB) ([]codeclarity.Analysis, error) {
 	var candidates []codeclarity.Analysis
 	err := db.NewSelect().
 		Model(&candidates).
@@ -93,6 +103,41 @@ func reapOnce(db *bun.DB, dr *DependencyResolver, service *boilerplates.ServiceB
 			string(codeclarity.STARTED),
 		})).
 		Scan(ctx)
+	return candidates, err
+}
+
+// recoverOnStartup re-drives every non-terminal analysis once, unconditionally:
+// after a restart the queue is empty, so there is nothing in flight to wait for.
+// Stage-0/pre-download analyses are re-driven through the downloader; later-stage
+// STARTED steps are force-reclaimed (age-independent) and re-dispatched.
+func recoverOnStartup(db *bun.DB, dr *DependencyResolver, service *boilerplates.ServiceBase) {
+	ctx := context.Background()
+	candidates, err := nonTerminalAnalyses(ctx, db)
+	if err != nil {
+		log.Printf("[reaper] startup candidate query failed: %v", err)
+		return
+	}
+	if len(candidates) == 0 {
+		log.Printf("[reaper] startup recovery: no non-terminal analyses")
+		return
+	}
+	timeout := stepStuckTimeout()
+	maxAge := recoveryMaxAge()
+	recovered := 0
+	for _, c := range candidates {
+		if recoverAnalysis(c.Id, db, dr, service, timeout, maxAge, true) {
+			recovered++
+		}
+	}
+	log.Printf("[reaper] startup recovery complete: %d candidate(s) examined, %d recovered", len(candidates), recovered)
+}
+
+// reapOnce finds every non-terminal analysis and reconciles each on the interval.
+// The finalizer takes a row lock, so a reaper pass that races a live completion is
+// safe — one wins the lock and transitions, the other no-ops.
+func reapOnce(db *bun.DB, dr *DependencyResolver, service *boilerplates.ServiceBase) {
+	ctx := context.Background()
+	candidates, err := nonTerminalAnalyses(ctx, db)
 	if err != nil {
 		log.Printf("[reaper] candidate query failed: %v", err)
 		return
@@ -102,13 +147,76 @@ func reapOnce(db *bun.DB, dr *DependencyResolver, service *boilerplates.ServiceB
 	}
 
 	timeout := stepStuckTimeout()
+	maxAge := recoveryMaxAge()
 	healed := 0
 	for _, c := range candidates {
-		if reapAnalysis(c.Id, db, dr, service, timeout) {
+		if recoverAnalysis(c.Id, db, dr, service, timeout, maxAge, false) {
 			healed++
 		}
 	}
 	log.Printf("[reaper] pass complete: %d candidate(s) examined, %d healed", len(candidates), healed)
+}
+
+// recoverAnalysis reconciles a single non-terminal analysis. It routes stage-0
+// recovery (re-run the downloader, then js-sbom) away from the in-place finalizer,
+// because stage 0 needs the project source on disk:
+//
+//   - stage 0 not yet all-success → redriveStageZero when force (startup, queue
+//     wiped) or when stuck beyond timeout (interval, avoids racing a fresh submit);
+//   - otherwise (stage >= 1, or stage 0 done-but-not-advanced) → the finalizer
+//     loop, which advances completed stages and re-dispatches lost later-stage steps.
+//
+// force re-drives/reclaims regardless of step age (the queue is known-empty at
+// startup), but the maxAge cap still applies — an abandoned analysis is retired,
+// not endlessly re-downloaded. Returns true if it made any change.
+func recoverAnalysis(id uuid.UUID, db *bun.DB, dr *DependencyResolver, service *boilerplates.ServiceBase, timeout, maxAge time.Duration, force bool) bool {
+	ctx := context.Background()
+	doc := &codeclarity.Analysis{Id: id}
+	if err := db.NewSelect().Model(doc).WherePK().Scan(ctx); err != nil {
+		log.Printf("[reaper] load %s failed: %v", id, err)
+		return false
+	}
+	switch doc.Status {
+	case codeclarity.COMPLETED, codeclarity.FAILURE, codeclarity.CANCELLED, codeclarity.UPDATING_DB:
+		return false
+	}
+	if len(doc.Steps) == 0 {
+		return false
+	}
+
+	// Retire analyses too old to be worth recovering (abandoned/broken): mark them
+	// FAILURE so they stop being candidates, rather than re-downloading stale work.
+	if analysisExpired(doc, time.Now(), maxAge) {
+		if err := failAnalysis(id, db); err != nil {
+			log.Printf("[reaper] retire (fail) expired %s failed: %v", id, err)
+			return false
+		}
+		log.Printf("[reaper] retired expired analysis %s (age cap %s)", id, maxAge)
+		return true
+	}
+
+	// Stage 0 not yet complete: a stage-0 plugin that reported FAILURE (its
+	// completion was lost) must be finalized as failure by the finalizer, not
+	// re-run. Otherwise re-drive via the downloader rather than in place, because
+	// js-sbom needs the project source on disk.
+	if doc.Stage == 0 {
+		anyFailure, allSuccess := evaluateStage(doc.Steps[0])
+		if !anyFailure && !allSuccess {
+			if !force && !stageZeroNeedsRedrive(doc, time.Now(), timeout) {
+				return false // fresh submit still downloading — leave it alone
+			}
+			if err := redriveStageZero(id, db, dr, service); err != nil {
+				log.Printf("[reaper] redrive stage-0 %s failed: %v", id, err)
+				return false
+			}
+			log.Printf("[reaper] re-drove stage-0 for %s", id)
+			return true
+		}
+		// stage 0 failed (→ finalize failure) or all-success (→ advance):
+		// fall through to the finalizer.
+	}
+
+	return reapAnalysis(id, db, dr, service, timeout, force)
 }
 
 // reapAnalysis reconciles a single analysis to a fixpoint: it re-runs the
@@ -116,10 +224,10 @@ func reapOnce(db *bun.DB, dr *DependencyResolver, service *boilerplates.ServiceB
 // so several lost-completion stages collapse in one pass instead of one stage
 // per tick. Returns true if it made any change. Messages produced along the way
 // are published after each committed step.
-func reapAnalysis(id uuid.UUID, db *bun.DB, dr *DependencyResolver, service *boilerplates.ServiceBase, timeout time.Duration) bool {
+func reapAnalysis(id uuid.UUID, db *bun.DB, dr *DependencyResolver, service *boilerplates.ServiceBase, timeout time.Duration, force bool) bool {
 	changed := false
 	for i := 0; i < maxReapIterations; i++ {
-		msgs, outcome, err := finalizeOrAdvanceStage(id, db, dr, false, timeout)
+		msgs, outcome, err := finalizeOrAdvanceStage(id, db, dr, false, timeout, force)
 		if err != nil {
 			log.Printf("[reaper] finalize %s failed: %v", id, err)
 			return changed
@@ -138,6 +246,9 @@ func reapAnalysis(id uuid.UUID, db *bun.DB, dr *DependencyResolver, service *boi
 			log.Printf("[reaper] advanced %s", id)
 			changed = true
 		}
+		// force applies only to the first reclaim pass; later iterations advance/
+		// dispatch from the reset state without re-reclaiming.
+		force = false
 	}
 	log.Printf("[reaper] %s did not converge within %d iterations", id, maxReapIterations)
 	return changed

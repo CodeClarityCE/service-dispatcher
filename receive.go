@@ -40,39 +40,43 @@ func evaluateStage(steps []codeclarity.Step) (anyFailure bool, allSuccess bool) 
 	return anyFailure, allSuccess
 }
 
-// reclaimStuckSteps clears STARTED steps whose dispatch is assumed lost — those
-// STARTED for longer than reclaimAfter (publish failure or a dead plugin). It is
-// pure: it mutates only doc.Steps and returns what the caller must persist.
+// reclaimStuckSteps clears later-stage (stage >= 1) STARTED steps whose dispatch
+// is assumed lost — those STARTED for longer than reclaimAfter (publish failure or
+// a dead plugin), or every STARTED step regardless of age when force is set (a
+// restart wiped the queue, so nothing is really in flight). It is pure: it mutates
+// only doc.Steps and returns whether the caller must persist (dirty).
 //
-//   - failStageZero is true if a stuck step is in stage 0; the caller fails the
-//     analysis because js-sbom cannot be safely re-run (it needs source on disk).
-//   - dirty is true if any later-stage step was reset (status/Started_on cleared)
-//     so the dispatch loop will re-send it.
+// Stage 0 is intentionally skipped here: js-sbom needs the project source on disk,
+// so a stuck stage-0 step is recovered by re-running the downloader via
+// redriveStageZero, not by resetting the step in place.
 //
-// reclaimAfter <= 0 disables reclaim entirely (the live, non-reaper callers).
-func reclaimStuckSteps(doc *codeclarity.Analysis, now time.Time, reclaimAfter time.Duration) (failStageZero, dirty bool) {
-	if reclaimAfter <= 0 {
-		return false, false
+// reclaimAfter <= 0 with force=false disables reclaim entirely (the live,
+// non-reaper callers).
+func reclaimStuckSteps(doc *codeclarity.Analysis, now time.Time, reclaimAfter time.Duration, force bool) (dirty bool) {
+	if !force && reclaimAfter <= 0 {
+		return false
 	}
 	for s := range doc.Steps {
+		if s == 0 {
+			continue
+		}
 		for i := range doc.Steps[s] {
 			st := &doc.Steps[s][i]
 			if st.Status != codeclarity.STARTED {
 				continue
 			}
-			started, perr := time.Parse(time.RFC3339Nano, st.Started_on)
-			if perr != nil || now.Sub(started) < reclaimAfter {
-				continue
-			}
-			if s == 0 {
-				return true, dirty
+			if !force {
+				started, perr := time.Parse(time.RFC3339Nano, st.Started_on)
+				if perr != nil || now.Sub(started) < reclaimAfter {
+					continue
+				}
 			}
 			st.Status = ""
 			st.Started_on = ""
 			dirty = true
 		}
 	}
-	return false, dirty
+	return dirty
 }
 
 // stageReadyPlugins mutates the in-memory analysis (setting ready, not-yet-started
@@ -158,14 +162,15 @@ func stageReadyPlugins(analysis *codeclarity.Analysis, stageIndex int, dr *Depen
 // and are always safe to (re)dispatch for lost-message recovery.
 //
 // reclaimAfter (reaper-only; live callers pass 0) recovers a *lost dispatch*: a
-// step left STARTED for longer than reclaimAfter is assumed dead (publish failure
-// or a crashed plugin). Later-stage steps are reset to "" so the dispatch loop
-// re-sends them; a stuck stage-0 step can't be safely re-run, so the analysis is
-// failed instead of hung.
+// later-stage step left STARTED for longer than reclaimAfter is assumed dead
+// (publish failure or a crashed plugin) and reset to "" so the dispatch loop
+// re-sends it. forceReclaim (reaper startup only) reclaims every later-stage
+// STARTED step regardless of age, since a restart wiped the queue and nothing is
+// really in flight. Stage 0 is never reclaimed here — see redriveStageZero.
 //
 // It returns an outcome describing the transition made ("completed", "failure",
 // "advanced", "dispatched", or "" for no-op) so callers (the reaper) can log it.
-func finalizeOrAdvanceStage(analysisId uuid.UUID, db *bun.DB, dr *DependencyResolver, allowStageZeroStart bool, reclaimAfter time.Duration) ([]pendingMessage, string, error) {
+func finalizeOrAdvanceStage(analysisId uuid.UUID, db *bun.DB, dr *DependencyResolver, allowStageZeroStart bool, reclaimAfter time.Duration, forceReclaim bool) ([]pendingMessage, string, error) {
 	ctx := context.Background()
 	var messages []pendingMessage
 	outcome := ""
@@ -212,18 +217,10 @@ func finalizeOrAdvanceStage(analysisId uuid.UUID, db *bun.DB, dr *DependencyReso
 
 		dirty := false
 
-		// Reaper-only: reclaim STARTED steps whose dispatch was lost. A stuck
-		// stage-0 step can't be safely re-run (js-sbom needs the source on disk)
-		// so the analysis is failed; later-stage steps are reset so the dispatch
-		// loop re-sends them.
-		if failStageZero, reclaimed := reclaimStuckSteps(doc, time.Now(), reclaimAfter); failStageZero {
-			doc.Status = codeclarity.FAILURE
-			outcome = "failure"
-			if _, e := tx.NewUpdate().Model(doc).WherePK().Exec(ctx); e != nil {
-				return e
-			}
-			return nil
-		} else if reclaimed {
+		// Reaper-only: reclaim later-stage STARTED steps whose dispatch was lost so
+		// the dispatch loop re-sends them. Stage 0 is recovered separately by
+		// redriveStageZero (js-sbom needs the source on disk), so it is skipped here.
+		if reclaimStuckSteps(doc, time.Now(), reclaimAfter, forceReclaim) {
 			dirty = true
 		}
 
@@ -298,6 +295,147 @@ func sendMessages(service *boilerplates.ServiceBase, msgs []pendingMessage) {
 			log.Printf("Failed to send message to %s: %v", m.queueName, err)
 		}
 	}
+}
+
+// analysisExpired reports whether a non-terminal analysis is older than maxAge and
+// should be retired instead of recovered. maxAge <= 0 disables the cap; a zero
+// Created_on (unknown age) is never treated as expired, so a row with a missing
+// timestamp is never retired defensively.
+func analysisExpired(doc *codeclarity.Analysis, now time.Time, maxAge time.Duration) bool {
+	if maxAge <= 0 || doc.Created_on.IsZero() {
+		return false
+	}
+	return now.Sub(doc.Created_on) > maxAge
+}
+
+// failAnalysis marks a non-terminal analysis FAILURE (status-guarded so it is
+// idempotent and never clobbers an already-terminal row). Used to retire analyses
+// too old to be worth recovering, so the reaper stops re-driving abandoned work.
+func failAnalysis(analysisId uuid.UUID, db *bun.DB) error {
+	ctx := context.Background()
+	_, err := db.NewUpdate().
+		Model((*codeclarity.Analysis)(nil)).
+		Set("status = ?", codeclarity.FAILURE).
+		Where("id = ?", analysisId).
+		Where("status IN (?)", bun.In([]string{
+			string(codeclarity.STARTED),
+			string(codeclarity.ONGOING),
+		})).
+		Exec(ctx)
+	return err
+}
+
+// stageZeroNeedsRedrive reports whether a non-terminal, stage-0 analysis has been
+// stuck at/before stage 0 long enough to re-drive it (interval reaper). It is true
+// when stage 0 is not yet fully successful and the most recent stage-0 activity is
+// older than timeout — covering both a pre-download analysis (steps never
+// dispatched: age from Created_on) and a stuck STARTED stage-0 step (age from its
+// Started_on). redriveStageZero stamps Started_on on re-drive, so this naturally
+// throttles repeated re-drives to one per timeout window.
+func stageZeroNeedsRedrive(doc *codeclarity.Analysis, now time.Time, timeout time.Duration) bool {
+	if doc.Stage != 0 || len(doc.Steps) == 0 {
+		return false
+	}
+	if _, allSuccess := evaluateStage(doc.Steps[0]); allSuccess {
+		return false // stage 0 done — the finalizer will advance it, no re-drive
+	}
+	ref := doc.Created_on
+	for _, st := range doc.Steps[0] {
+		if st.Started_on == "" {
+			continue
+		}
+		if t, err := time.Parse(time.RFC3339Nano, st.Started_on); err == nil && t.After(ref) {
+			ref = t
+		}
+	}
+	return now.Sub(ref) >= timeout
+}
+
+// redriveStageZero recovers an analysis stranded at or before stage 0 after a
+// restart wiped the queue. Stage 0 (js-sbom) reads the project source from disk,
+// so it cannot simply be re-dispatched like a later stage — the source must be
+// re-fetched first. Under a row lock it resets stage-0 steps (so they are not
+// blocked by a stale STARTED) and stamps Started_on as the re-drive time (so the
+// interval reaper throttles repeated re-drives). It then either re-sends the
+// project to the downloader (VCS / FILE projects) — which calls back into
+// dispatchDownloaderResult to start stage 0 — or, for projects needing no
+// download, starts stage 0 directly. Idempotent: terminal/advanced analyses are a
+// no-op, and re-running the downloader is safe (Git handles an existing checkout).
+func redriveStageZero(analysisId uuid.UUID, db *bun.DB, dr *DependencyResolver, service *boilerplates.ServiceBase) error {
+	ctx := context.Background()
+	var (
+		projectId, organizationId uuid.UUID
+		proceed                   bool
+	)
+	now := time.Now().Format(time.RFC3339Nano)
+	err := db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
+		doc := &codeclarity.Analysis{Id: analysisId}
+		if e := tx.NewSelect().Model(doc).WherePK().For("UPDATE").Scan(ctx); e != nil {
+			return fmt.Errorf("lock+reload analysis %s: %w", analysisId, e)
+		}
+		switch doc.Status {
+		case codeclarity.COMPLETED, codeclarity.FAILURE, codeclarity.CANCELLED, codeclarity.UPDATING_DB:
+			return nil // terminal/transient — nothing to re-drive
+		}
+		if doc.Stage != 0 || len(doc.Steps) == 0 {
+			return nil // advanced past stage 0 since selection — let the finalizer handle it
+		}
+		if _, allSuccess := evaluateStage(doc.Steps[0]); allSuccess {
+			return nil // stage 0 already done — the finalizer will advance it
+		}
+		// Reset stage-0 steps so re-dispatch is not blocked by a stale STARTED, and
+		// stamp the re-drive time so the interval reaper does not thrash.
+		for i := range doc.Steps[0] {
+			doc.Steps[0][i].Status = ""
+			doc.Steps[0][i].Started_on = now
+			doc.Steps[0][i].Ended_on = ""
+		}
+		doc.Status = codeclarity.STARTED
+		if _, e := tx.NewUpdate().Model(doc).WherePK().Exec(ctx); e != nil {
+			return e
+		}
+		if doc.ProjectId != nil {
+			projectId = *doc.ProjectId
+		}
+		organizationId = doc.OrganizationId
+		proceed = true
+		return nil
+	})
+	if err != nil || !proceed {
+		return err
+	}
+
+	// Decide download vs direct stage-0 start exactly as the live api_request path.
+	project := &codeclarity.Project{Id: projectId}
+	if e := db.NewSelect().Model(project).WherePK().Scan(ctx); e != nil {
+		return fmt.Errorf("redrive: load project %s: %w", projectId, e)
+	}
+	if project.Type == "FILE" || project.Integration_id != "" {
+		var integrationId uuid.UUID
+		if project.Integration_id != "" {
+			if id, perr := uuid.Parse(project.Integration_id); perr == nil {
+				integrationId = id
+			} else {
+				log.Printf("[redrive] bad integration_id %q on project %s: %v", project.Integration_id, projectId, perr)
+			}
+		}
+		downloaderMessage := types_amqp.DispatcherDownloaderMessage{
+			AnalysisId:     analysisId,
+			ProjectId:      projectId,
+			IntegrationId:  integrationId,
+			OrganizationId: organizationId,
+		}
+		data, _ := json.Marshal(downloaderMessage)
+		return service.SendMessage("dispatcher_downloader", data)
+	}
+
+	// No download needed — start stage 0 directly.
+	msgs, _, e := finalizeOrAdvanceStage(analysisId, db, dr, true, 0, false)
+	if e != nil {
+		return e
+	}
+	sendMessages(service, msgs)
+	return nil
 }
 
 // dispatch routes an incoming message based on its source queue.
@@ -423,7 +561,7 @@ func dispatchAPIRequest(d amqp.Delivery, dependencyResolver *DependencyResolver,
 	}
 
 	// No download needed — start stage 0 directly.
-	msgs, _, e := finalizeOrAdvanceStage(analysisId, db, dependencyResolver, true, 0)
+	msgs, _, e := finalizeOrAdvanceStage(analysisId, db, dependencyResolver, true, 0, false)
 	if e != nil {
 		log.Printf("[dispatch:api_request] stage-0 start failed for %s, dropping (reaper will retry): %v", analysisId, e)
 		return
@@ -437,7 +575,7 @@ func dispatchDownloaderResult(d amqp.Delivery, dependencyResolver *DependencyRes
 		log.Printf("[dispatch:downloader_dispatcher] bad message, dropping: %v", err)
 		return
 	}
-	msgs, _, err := finalizeOrAdvanceStage(msg.AnalysisId, service.DB.CodeClarity, dependencyResolver, true, 0)
+	msgs, _, err := finalizeOrAdvanceStage(msg.AnalysisId, service.DB.CodeClarity, dependencyResolver, true, 0, false)
 	if err != nil {
 		log.Printf("[dispatch:downloader_dispatcher] stage-0 start failed for %s, dropping (reaper will retry): %v", msg.AnalysisId, err)
 		return
@@ -451,7 +589,7 @@ func dispatchPluginResult(d amqp.Delivery, dependencyResolver *DependencyResolve
 		log.Printf("[dispatch:plugins_dispatcher] bad message, dropping: %v", err)
 		return
 	}
-	msgs, _, err := finalizeOrAdvanceStage(msg.AnalysisId, service.DB.CodeClarity, dependencyResolver, true, 0)
+	msgs, _, err := finalizeOrAdvanceStage(msg.AnalysisId, service.DB.CodeClarity, dependencyResolver, true, 0, false)
 	if err != nil {
 		log.Printf("[dispatch:plugins_dispatcher] finalize failed for %s, dropping (reaper will retry): %v", msg.AnalysisId, err)
 		return
