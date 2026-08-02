@@ -320,6 +320,8 @@ func failAnalysis(analysisId uuid.UUID, db *bun.DB) error {
 		Where("status IN (?)", bun.In([]string{
 			string(codeclarity.STARTED),
 			string(codeclarity.ONGOING),
+			string(codeclarity.REQUESTED),
+			string(codeclarity.TRIGGERED),
 		})).
 		Exec(ctx)
 	return err

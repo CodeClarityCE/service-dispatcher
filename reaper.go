@@ -91,8 +91,19 @@ func runReaper(db *bun.DB, dr *DependencyResolver, service *boilerplates.Service
 	}
 }
 
-// nonTerminalAnalyses returns the ids of every analysis still in a STARTED/ONGOING
-// state — the only ones that can be orphaned or stuck.
+// nonTerminalAnalyses returns the ids of every analysis that can be orphaned or
+// stuck: the in-flight states (STARTED/ONGOING) plus the API's pre-dispatch states
+// (REQUESTED/TRIGGERED). The latter matter because an analysis is created REQUESTED
+// and only flips to STARTED once the dispatcher consumes its api_request message —
+// if that message is lost (RabbitMQ has no dev volume, so a restart wipes it), the
+// analysis is stranded REQUESTED with nothing to drive it. recoverAnalysis treats a
+// REQUESTED stage-0 analysis exactly like the live first dispatch (re-drive via the
+// downloader, or start stage 0 directly).
+//
+// Recurring scheduled templates (schedule_type 'daily'/'weekly') also sit in a
+// pre-dispatch status indefinitely by design — the scheduler clones them into
+// 'once' executions — so they are excluded here to avoid the reaper running a
+// template directly. 'once' and legacy NULL rows are eligible.
 func nonTerminalAnalyses(ctx context.Context, db *bun.DB) ([]codeclarity.Analysis, error) {
 	var candidates []codeclarity.Analysis
 	err := db.NewSelect().
@@ -101,7 +112,10 @@ func nonTerminalAnalyses(ctx context.Context, db *bun.DB) ([]codeclarity.Analysi
 		Where("status IN (?)", bun.In([]string{
 			string(codeclarity.ONGOING),
 			string(codeclarity.STARTED),
+			string(codeclarity.REQUESTED),
+			string(codeclarity.TRIGGERED),
 		})).
+		Where("(schedule_type IS NULL OR schedule_type = ?)", "once").
 		Scan(ctx)
 	return candidates, err
 }
