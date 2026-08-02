@@ -219,6 +219,18 @@ func recoverAnalysis(id uuid.UUID, db *bun.DB, dr *DependencyResolver, service *
 			if !force && !stageZeroNeedsRedrive(doc, time.Now(), timeout) {
 				return false // fresh submit still downloading — leave it alone
 			}
+			// A "stuck" stage-0 analysis whose download queue still holds
+			// messages is almost certainly just waiting its turn behind a deep
+			// backlog — its message is not lost, and re-driving it would add a
+			// duplicate to the very queue causing the wait (each interval pass
+			// amplifying the backlog further). Re-drive only once the queue has
+			// drained; a genuinely lost message is recovered then, merely later.
+			// The startup pass (force) skips this: the queue is known-empty.
+			if !force {
+				if depth, err := service.QueueDepth("dispatcher_downloader"); err == nil && depth > 0 {
+					return false
+				}
+			}
 			if err := redriveStageZero(id, db, dr, service); err != nil {
 				log.Printf("[reaper] redrive stage-0 %s failed: %v", id, err)
 				return false
