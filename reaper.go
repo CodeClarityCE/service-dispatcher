@@ -251,9 +251,10 @@ func recoverAnalysis(id uuid.UUID, db *bun.DB, dr *DependencyResolver, service *
 // per tick. Returns true if it made any change. Messages produced along the way
 // are published after each committed step.
 func reapAnalysis(id uuid.UUID, db *bun.DB, dr *DependencyResolver, service *boilerplates.ServiceBase, timeout time.Duration, force bool) bool {
+	pluginBusy := pluginQueueBusyChecker(id, service)
 	changed := false
 	for i := 0; i < maxReapIterations; i++ {
-		msgs, outcome, err := finalizeOrAdvanceStage(id, db, dr, false, timeout, force)
+		msgs, outcome, err := finalizeOrAdvanceStage(id, db, dr, false, timeout, force, pluginBusy)
 		if err != nil {
 			log.Printf("[reaper] finalize %s failed: %v", id, err)
 			return changed
@@ -265,8 +266,11 @@ func reapAnalysis(id uuid.UUID, db *bun.DB, dr *DependencyResolver, service *boi
 			log.Printf("[reaper] finalized %s -> %s", id, outcome)
 			return true
 		case "dispatched":
-			log.Printf("[reaper] re-dispatched %d plugin(s) for %s", len(msgs), id)
-			sendMessages(service, msgs)
+			msgs = dropCompletedStepMessages(id, db, msgs)
+			if len(msgs) > 0 {
+				log.Printf("[reaper] re-dispatched %d plugin(s) for %s", len(msgs), id)
+				sendMessages(service, msgs)
+			}
 			changed = true
 		case "advanced":
 			log.Printf("[reaper] advanced %s", id)
@@ -278,4 +282,68 @@ func reapAnalysis(id uuid.UUID, db *bun.DB, dr *DependencyResolver, service *boi
 	}
 	log.Printf("[reaper] %s did not converge within %d iterations", id, maxReapIterations)
 	return changed
+}
+
+// pluginQueueBusyChecker returns a memoized predicate reporting whether a
+// plugin's dispatch queue still holds messages, for the stuck-step reclaim in
+// reclaimStuckSteps (the step-level twin of the stage-0 downloader guard in
+// recoverAnalysis). Memoized so one reap of an analysis probes each queue at
+// most once across the fixpoint iterations; a failed probe counts as not-busy
+// (matching the stage-0 guard) so a broken AMQP path never blocks recovery.
+func pluginQueueBusyChecker(id uuid.UUID, service *boilerplates.ServiceBase) func(plugin string) bool {
+	busyByPlugin := make(map[string]bool)
+	return func(plugin string) bool {
+		busy, probed := busyByPlugin[plugin]
+		if !probed {
+			depth, err := service.QueueDepth("dispatcher_" + plugin)
+			busy = err == nil && depth > 0
+			busyByPlugin[plugin] = busy
+			if busy {
+				log.Printf("[reaper] skip reclaim of step %s for %s: dispatcher_%s holds %d message(s), dispatch likely still queued", plugin, id, plugin, depth)
+			}
+		}
+		return busy
+	}
+}
+
+// dropCompletedStepMessages re-reads the analysis after the reclaim transaction
+// has committed and drops any pending dispatch whose step already reports
+// SUCCESS: the original in-flight run can complete in the window between the
+// stuck-scan commit and the publish, and publishing then would duplicate the
+// whole plugin run. On a failed re-read it publishes everything as-is — a
+// duplicate is wasted work, a withheld lost message is a stall.
+func dropCompletedStepMessages(id uuid.UUID, db *bun.DB, msgs []pendingMessage) []pendingMessage {
+	if len(msgs) == 0 {
+		return msgs
+	}
+	doc := &codeclarity.Analysis{Id: id}
+	if err := db.NewSelect().Model(doc).WherePK().Scan(context.Background()); err != nil {
+		log.Printf("[reaper] pre-publish recheck of %s failed, publishing as-is: %v", id, err)
+		return msgs
+	}
+	return dropSucceededSteps(doc, msgs)
+}
+
+// dropSucceededSteps returns msgs minus those whose step in doc is already
+// SUCCESS. Pure (no DB) so dropCompletedStepMessages stays testable.
+func dropSucceededSteps(doc *codeclarity.Analysis, msgs []pendingMessage) []pendingMessage {
+	kept := msgs[:0]
+	for _, m := range msgs {
+		if m.stage >= 0 && m.stage < len(doc.Steps) && stepSucceeded(doc.Steps[m.stage], m.plugin) {
+			log.Printf("[reaper] skip re-dispatch of step %s (stage %d) for %s: step already SUCCESS", m.plugin, m.stage, doc.Id)
+			continue
+		}
+		kept = append(kept, m)
+	}
+	return kept
+}
+
+// stepSucceeded reports whether the named step within a stage is SUCCESS.
+func stepSucceeded(stage []codeclarity.Step, name string) bool {
+	for _, st := range stage {
+		if st.Name == name {
+			return st.Status == codeclarity.SUCCESS
+		}
+	}
+	return false
 }

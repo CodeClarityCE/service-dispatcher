@@ -146,7 +146,7 @@ func TestReclaimStuckSteps(t *testing.T) {
 			{{Name: "js-sbom", Status: codeclarity.SUCCESS}},
 			{{Name: "vuln-finder", Status: codeclarity.STARTED, Started_on: stale}},
 		}}
-		if dirty := reclaimStuckSteps(doc, now, 0, false); dirty {
+		if dirty := reclaimStuckSteps(doc, now, 0, false, nil); dirty {
 			t.Fatalf("reclaim must be a no-op when disabled, got dirty=%v", dirty)
 		}
 		if doc.Steps[1][0].Status != codeclarity.STARTED {
@@ -158,7 +158,7 @@ func TestReclaimStuckSteps(t *testing.T) {
 		doc := &codeclarity.Analysis{Steps: [][]codeclarity.Step{
 			{{Name: "js-sbom", Status: codeclarity.STARTED, Started_on: stale}},
 		}}
-		if dirty := reclaimStuckSteps(doc, now, timeout, false); dirty {
+		if dirty := reclaimStuckSteps(doc, now, timeout, false, nil); dirty {
 			t.Fatalf("stage 0 must be skipped by reclaim, got dirty=%v", dirty)
 		}
 		if doc.Steps[0][0].Status != codeclarity.STARTED {
@@ -171,7 +171,7 @@ func TestReclaimStuckSteps(t *testing.T) {
 			{{Name: "js-sbom", Status: codeclarity.SUCCESS}},
 			{{Name: "vuln-finder", Status: codeclarity.STARTED, Started_on: stale}},
 		}}
-		if dirty := reclaimStuckSteps(doc, now, timeout, false); !dirty {
+		if dirty := reclaimStuckSteps(doc, now, timeout, false, nil); !dirty {
 			t.Fatalf("expected dirty=true")
 		}
 		if doc.Steps[1][0].Status != "" || doc.Steps[1][0].Started_on != "" {
@@ -184,7 +184,7 @@ func TestReclaimStuckSteps(t *testing.T) {
 			{{Name: "js-sbom", Status: codeclarity.SUCCESS}},
 			{{Name: "vuln-finder", Status: codeclarity.STARTED, Started_on: fresh}},
 		}}
-		if dirty := reclaimStuckSteps(doc, now, timeout, false); dirty {
+		if dirty := reclaimStuckSteps(doc, now, timeout, false, nil); dirty {
 			t.Fatalf("fresh STARTED step must be untouched, got dirty=%v", dirty)
 		}
 	})
@@ -194,7 +194,7 @@ func TestReclaimStuckSteps(t *testing.T) {
 			{{Name: "js-sbom", Status: codeclarity.SUCCESS}},
 			{{Name: "vuln-finder", Status: codeclarity.STARTED, Started_on: fresh}},
 		}}
-		if dirty := reclaimStuckSteps(doc, now, 0, true); !dirty {
+		if dirty := reclaimStuckSteps(doc, now, 0, true, nil); !dirty {
 			t.Fatalf("force must reclaim regardless of age, got dirty=%v", dirty)
 		}
 		if doc.Steps[1][0].Status != "" || doc.Steps[1][0].Started_on != "" {
@@ -203,6 +203,49 @@ func TestReclaimStuckSteps(t *testing.T) {
 		// Even when forced, stage 0 stays put.
 		if doc.Steps[0][0].Status != codeclarity.SUCCESS {
 			t.Fatal("stage 0 must remain untouched even when forced")
+		}
+	})
+
+	t.Run("busy plugin queue defers reclaim of a stale step", func(t *testing.T) {
+		doc := &codeclarity.Analysis{Steps: [][]codeclarity.Step{
+			{{Name: "js-sbom", Status: codeclarity.SUCCESS}},
+			{{Name: "vuln-finder", Status: codeclarity.STARTED, Started_on: stale}},
+		}}
+		var probed []string
+		busy := func(name string) bool { probed = append(probed, name); return true }
+		if dirty := reclaimStuckSteps(doc, now, timeout, false, busy); dirty {
+			t.Fatalf("busy queue must defer reclaim, got dirty=%v", dirty)
+		}
+		if doc.Steps[1][0].Status != codeclarity.STARTED {
+			t.Fatal("step must stay STARTED while its queue holds messages")
+		}
+		if len(probed) != 1 || probed[0] != "vuln-finder" {
+			t.Fatalf("expected a single probe for vuln-finder, got %v", probed)
+		}
+	})
+
+	t.Run("busy check only runs for stale steps", func(t *testing.T) {
+		doc := &codeclarity.Analysis{Steps: [][]codeclarity.Step{
+			{{Name: "js-sbom", Status: codeclarity.SUCCESS}},
+			{{Name: "vuln-finder", Status: codeclarity.STARTED, Started_on: fresh}},
+		}}
+		busy := func(string) bool { t.Fatal("fresh step must not probe the queue"); return true }
+		if dirty := reclaimStuckSteps(doc, now, timeout, false, busy); dirty {
+			t.Fatalf("fresh STARTED step must be untouched, got dirty=%v", dirty)
+		}
+	})
+
+	t.Run("force ignores the busy check", func(t *testing.T) {
+		doc := &codeclarity.Analysis{Steps: [][]codeclarity.Step{
+			{{Name: "js-sbom", Status: codeclarity.SUCCESS}},
+			{{Name: "vuln-finder", Status: codeclarity.STARTED, Started_on: stale}},
+		}}
+		busy := func(string) bool { return true }
+		if dirty := reclaimStuckSteps(doc, now, 0, true, busy); !dirty {
+			t.Fatalf("force must reclaim even with a busy queue, got dirty=%v", dirty)
+		}
+		if doc.Steps[1][0].Status != "" {
+			t.Fatalf("forced reclaim must clear the step, got %+v", doc.Steps[1][0])
 		}
 	})
 }

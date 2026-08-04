@@ -22,6 +22,10 @@ import (
 type pendingMessage struct {
 	queueName string
 	data      []byte
+	// plugin + stage identify the dispatched step so the reaper can re-check its
+	// status right before publish (see dropCompletedStepMessages).
+	plugin string
+	stage  int
 }
 
 // evaluateStage reports the terminal state of a stage's steps.
@@ -52,7 +56,15 @@ func evaluateStage(steps []codeclarity.Step) (anyFailure bool, allSuccess bool) 
 //
 // reclaimAfter <= 0 with force=false disables reclaim entirely (the live,
 // non-reaper callers).
-func reclaimStuckSteps(doc *codeclarity.Analysis, now time.Time, reclaimAfter time.Duration, force bool) (dirty bool) {
+//
+// pluginBusy (nil disables the check) reports whether a plugin's dispatch queue
+// still holds messages. A stuck step whose queue is non-empty is almost
+// certainly waiting its turn behind a deep backlog — its dispatch is not lost,
+// and reclaiming it would add a duplicate to the very queue causing the wait
+// (mirroring the stage-0 downloader guard in recoverAnalysis). Such steps are
+// skipped; a genuinely lost dispatch is reclaimed once the queue drains. force
+// ignores the check: at startup the queue is known-empty.
+func reclaimStuckSteps(doc *codeclarity.Analysis, now time.Time, reclaimAfter time.Duration, force bool, pluginBusy func(name string) bool) (dirty bool) {
 	if !force && reclaimAfter <= 0 {
 		return false
 	}
@@ -68,6 +80,9 @@ func reclaimStuckSteps(doc *codeclarity.Analysis, now time.Time, reclaimAfter ti
 			if !force {
 				started, perr := time.Parse(time.RFC3339Nano, st.Started_on)
 				if perr != nil || now.Sub(started) < reclaimAfter {
+					continue
+				}
+				if pluginBusy != nil && pluginBusy(st.Name) {
 					continue
 				}
 			}
@@ -128,7 +143,7 @@ func stageReadyPlugins(analysis *codeclarity.Analysis, stageIndex int, dr *Depen
 		// Stamp the dispatch time so the reaper can age a STARTED step and reclaim
 		// it if its dispatch was lost (the plugin sets its own Started_on on run).
 		analysis.Steps[stageIndex][stepId].Started_on = time.Now().Format(time.RFC3339Nano)
-		msgs = append(msgs, pendingMessage{queueName: "dispatcher_" + step.Name, data: data})
+		msgs = append(msgs, pendingMessage{queueName: "dispatcher_" + step.Name, data: data, plugin: step.Name, stage: stageIndex})
 		staged = true
 	}
 	return msgs, staged
@@ -168,9 +183,13 @@ func stageReadyPlugins(analysis *codeclarity.Analysis, stageIndex int, dr *Depen
 // STARTED step regardless of age, since a restart wiped the queue and nothing is
 // really in flight. Stage 0 is never reclaimed here — see redriveStageZero.
 //
+// pluginBusy (reaper-only; live callers pass nil) gates the reclaim per plugin:
+// a step whose dispatch queue still holds messages is skipped rather than
+// re-dispatched — see reclaimStuckSteps. Ignored on forceReclaim.
+//
 // It returns an outcome describing the transition made ("completed", "failure",
 // "advanced", "dispatched", or "" for no-op) so callers (the reaper) can log it.
-func finalizeOrAdvanceStage(analysisId uuid.UUID, db *bun.DB, dr *DependencyResolver, allowStageZeroStart bool, reclaimAfter time.Duration, forceReclaim bool) ([]pendingMessage, string, error) {
+func finalizeOrAdvanceStage(analysisId uuid.UUID, db *bun.DB, dr *DependencyResolver, allowStageZeroStart bool, reclaimAfter time.Duration, forceReclaim bool, pluginBusy func(name string) bool) ([]pendingMessage, string, error) {
 	ctx := context.Background()
 	var messages []pendingMessage
 	outcome := ""
@@ -220,7 +239,7 @@ func finalizeOrAdvanceStage(analysisId uuid.UUID, db *bun.DB, dr *DependencyReso
 		// Reaper-only: reclaim later-stage STARTED steps whose dispatch was lost so
 		// the dispatch loop re-sends them. Stage 0 is recovered separately by
 		// redriveStageZero (js-sbom needs the source on disk), so it is skipped here.
-		if reclaimStuckSteps(doc, time.Now(), reclaimAfter, forceReclaim) {
+		if reclaimStuckSteps(doc, time.Now(), reclaimAfter, forceReclaim, pluginBusy) {
 			dirty = true
 		}
 
@@ -432,7 +451,7 @@ func redriveStageZero(analysisId uuid.UUID, db *bun.DB, dr *DependencyResolver, 
 	}
 
 	// No download needed — start stage 0 directly.
-	msgs, _, e := finalizeOrAdvanceStage(analysisId, db, dr, true, 0, false)
+	msgs, _, e := finalizeOrAdvanceStage(analysisId, db, dr, true, 0, false, nil)
 	if e != nil {
 		return e
 	}
@@ -563,7 +582,7 @@ func dispatchAPIRequest(d amqp.Delivery, dependencyResolver *DependencyResolver,
 	}
 
 	// No download needed — start stage 0 directly.
-	msgs, _, e := finalizeOrAdvanceStage(analysisId, db, dependencyResolver, true, 0, false)
+	msgs, _, e := finalizeOrAdvanceStage(analysisId, db, dependencyResolver, true, 0, false, nil)
 	if e != nil {
 		log.Printf("[dispatch:api_request] stage-0 start failed for %s, dropping (reaper will retry): %v", analysisId, e)
 		return
@@ -577,7 +596,7 @@ func dispatchDownloaderResult(d amqp.Delivery, dependencyResolver *DependencyRes
 		log.Printf("[dispatch:downloader_dispatcher] bad message, dropping: %v", err)
 		return
 	}
-	msgs, _, err := finalizeOrAdvanceStage(msg.AnalysisId, service.DB.CodeClarity, dependencyResolver, true, 0, false)
+	msgs, _, err := finalizeOrAdvanceStage(msg.AnalysisId, service.DB.CodeClarity, dependencyResolver, true, 0, false, nil)
 	if err != nil {
 		log.Printf("[dispatch:downloader_dispatcher] stage-0 start failed for %s, dropping (reaper will retry): %v", msg.AnalysisId, err)
 		return
@@ -591,7 +610,7 @@ func dispatchPluginResult(d amqp.Delivery, dependencyResolver *DependencyResolve
 		log.Printf("[dispatch:plugins_dispatcher] bad message, dropping: %v", err)
 		return
 	}
-	msgs, _, err := finalizeOrAdvanceStage(msg.AnalysisId, service.DB.CodeClarity, dependencyResolver, true, 0, false)
+	msgs, _, err := finalizeOrAdvanceStage(msg.AnalysisId, service.DB.CodeClarity, dependencyResolver, true, 0, false, nil)
 	if err != nil {
 		log.Printf("[dispatch:plugins_dispatcher] finalize failed for %s, dropping (reaper will retry): %v", msg.AnalysisId, err)
 		return
