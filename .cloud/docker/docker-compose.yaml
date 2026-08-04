@@ -20,6 +20,10 @@ services:
         condition: service_started
     env_file:
       - ../../.cloud/env/.env.dev
+    environment:
+      # Seconds (4h). Literal value: `environment:` ${VAR} interpolation reads
+      # the host shell, not the service's env_file.
+      - REAPER_STEP_TIMEOUT=14400
 
 volumes:
   projects:
