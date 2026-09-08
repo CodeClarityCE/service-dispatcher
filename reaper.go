@@ -253,7 +253,7 @@ func recoverAnalysis(id uuid.UUID, db *bun.DB, dr *DependencyResolver, service *
 func reapAnalysis(id uuid.UUID, db *bun.DB, dr *DependencyResolver, service *boilerplates.ServiceBase, timeout time.Duration, force bool) bool {
 	pluginBusy := pluginQueueBusyChecker(id, service)
 	changed := false
-	for i := 0; i < maxReapIterations; i++ {
+	for range maxReapIterations {
 		msgs, outcome, err := finalizeOrAdvanceStage(id, db, dr, false, timeout, force, pluginBusy)
 		if err != nil {
 			log.Printf("[reaper] finalize %s failed: %v", id, err)

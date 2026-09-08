@@ -269,10 +269,7 @@ func finalizeOrAdvanceStage(analysisId uuid.UUID, db *bun.DB, dr *DependencyReso
 		}
 
 		// Dispatch any plugins that are now ready.
-		maxStage := doc.Stage
-		if maxStage > len(doc.Steps)-1 {
-			maxStage = len(doc.Steps) - 1
-		}
+		maxStage := min(doc.Stage, len(doc.Steps)-1)
 		for s := 0; s <= maxStage; s++ {
 			// Never re-initiate stage 0 from a context that can't guarantee the
 			// source is on disk (the reaper). That path belongs to the downloader.
