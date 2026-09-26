@@ -8,19 +8,17 @@ pipeline {
         buildDiscarder(logRotator(numToKeepStr: '10'))
     }
 
-    environment {
-        DOCKERHUB_CREDENTIALS = credentials('dockerhub')
-    }
-
     stages {
         stage('Setup') {
             steps {
-                sh 'echo $DOCKERHUB_CREDENTIALS_PSW | docker login -u $DOCKERHUB_CREDENTIALS_USR --password-stdin'
                 script {
                     def project = readJSON file: 'config.json'
-                    env.Version = project.version           // e.g., v0.0.15-alpha
-                    env.ImageName = project.image_name      // e.g., codeclarityce/service-dispatcher
-                    env.Tag = "${ImageName}:${Version.substring(1)}"  // Remove 'v' prefix for Docker tag
+                    env.Version = project.version                       // e.g. v0.0.15-alpha
+                    env.ImageName = project.image_name                  // e.g. codeclarityce/plugin-js-sbom
+                    env.Tag = "${ImageName}:${Version.substring(1)}"    // Docker tag drops the 'v'
+                    // One buildx builder per image: a shared name let concurrent
+                    // jobs on the agent reuse or remove each other's builder.
+                    env.Builder = "builder-${ImageName.tokenize('/').last()}"
                     echo "Version: ${Version}, Tag: ${Tag}"
                 }
                 sh 'git submodule update --init --recursive'
@@ -34,19 +32,54 @@ pipeline {
             }
             steps {
                 script {
-                    def mainVersion = sh(
-                        script: "git show origin/main:config.json | jq -r '.version'",
+                    // No `|| true`: if main can't be fetched the check must fail,
+                    // not compare against an empty version and pass.
+                    sh 'git fetch --force origin main:refs/remotes/origin/main'
+                    if (sh(script: 'git cat-file -e origin/main:config.json', returnStatus: true) != 0) {
+                        echo 'No config.json on main yet, skipping version check'
+                        return
+                    }
+                    def mainVersion = readJSON(text: sh(script: 'git show origin/main:config.json', returnStdout: true)).version
+                    def highest = sh(
+                        script: "printf '%s\\n%s\\n' '${mainVersion}' '${Version}' | sort -V | tail -n1",
                         returnStdout: true
                     ).trim()
 
                     echo "PR Version: ${Version}"
                     echo "Main Version: ${mainVersion}"
 
-                    if (Version == mainVersion) {
-                        error "Version not bumped! PR version (${Version}) equals main version (${mainVersion}). Please update config.json version."
+                    if (Version == mainVersion || highest != Version) {
+                        error "Version not bumped! PR version (${Version}) must be greater than main version (${mainVersion}). Please update config.json version."
                     }
                     echo "Version check passed: ${mainVersion} -> ${Version}"
                 }
+            }
+        }
+
+        stage('Test') {
+            // Pinned Go toolchain instead of whatever the agent host has. Keep the
+            // image in sync with .cloud/docker/Dockerfile and go.mod (go 1.27.1).
+            // GOWORK=off matches the image build, which deletes go.work: deps come
+            // from go.mod, so this passes once scripts/release-all.sh has bumped
+            // them to the released utility versions.
+            agent {
+                docker {
+                    image 'golang:1.27.1@sha256:3680233e3204827fbdc66088528ae6d4b3d034f51d03a99d454f6de034888244'
+                    reuseNode true
+                }
+            }
+            environment {
+                HOME = "${env.WORKSPACE}@tmp/ci-home"
+                GOCACHE = "${env.WORKSPACE}@tmp/go-build"
+                GOMODCACHE = "${env.WORKSPACE}@tmp/go-mod"
+                GOTOOLCHAIN = 'local'
+                GOWORK = 'off'
+                GOPRIVATE = 'github.com/CodeClarityCE/*'
+            }
+            steps {
+                sh 'go vet ./...'
+                sh 'go test ./...'
+                sh 'go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...'
             }
         }
 
@@ -63,19 +96,30 @@ pipeline {
             when {
                 branch 'main'
             }
+            environment {
+                // Bound only here so PR and branch builds never see the token.
+                DOCKERHUB_CREDENTIALS = credentials('dockerhub')
+            }
             steps {
                 script {
+                    // A released version is immutable: never overwrite its image
+                    // (e.g. a direct push to main without a version bump).
+                    if (sh(script: "git tag -l '${Version}' | grep -q .", returnStatus: true) == 0) {
+                        echo "Release ${Version} already exists, skipping image push and release."
+                        return
+                    }
+
+                    sh 'echo "$DOCKERHUB_CREDENTIALS_PSW" | docker login -u "$DOCKERHUB_CREDENTIALS_USR" --password-stdin'
+
                     // Reuse existing builder or create new one
-                    sh 'docker buildx create --name builder --use --bootstrap 2>/dev/null || docker buildx use builder'
+                    sh "docker buildx create --name ${Builder} --use --bootstrap 2>/dev/null || docker buildx use ${Builder}"
 
                     // Build and push first (can be retried without side effects)
                     sh "docker buildx build -f .cloud/docker/Dockerfile --platform linux/amd64,linux/arm64 --target plugin --tag ${ImageName}:latest --tag ${Tag} --push ."
 
-                    // Only create tag and release after successful push
-                    def tagExists = sh(script: "git tag -l '${Version}' | grep -q .", returnStatus: true) == 0
-                    if (!tagExists) {
-                        sh "gh release create '${Version}' --title 'Release ${Version}' --generate-notes --prerelease=\$(echo '${Version}' | grep -q 'alpha\\|beta' && echo true || echo false)"
-                    }
+                    // Only create tag and release after successful push. --target
+                    // pins the tag to the commit that was built, not main's tip.
+                    sh "gh release create '${Version}' --target \"\$GIT_COMMIT\" --title 'Release ${Version}' --generate-notes --prerelease=\$(echo '${Version}' | grep -q 'alpha\\|beta' && echo true || echo false)"
                 }
             }
         }
@@ -83,10 +127,9 @@ pipeline {
 
     post {
         failure {
-            echo "Build failed for ${env.ImageName ?: 'unknown'}:${env.Tag ?: 'unknown'}"
-            node('codeclarity') {
-                sh 'docker buildx rm builder || true'
-            }
+            echo "Build failed for ${env.Tag ?: 'unknown'}"
+            // Drop a possibly broken builder; the next deploy recreates it.
+            sh "docker buildx rm ${env.Builder ?: 'none'} || true"
         }
     }
 }
