@@ -1,3 +1,27 @@
+// Runs `script` in the pinned Go toolchain instead of whatever the agent host
+// has. Keep the image in sync with .cloud/docker/Dockerfile and go.mod
+// (go 1.27.1). Plain `docker run` rather than `agent { docker }`, which needs
+// the Docker Pipeline plugin (up for adoption, deliberately not used). The
+// container runs as the Jenkins uid; HOME and the Go caches live in the
+// workspace's @tmp sibling. GOWORK=off matches the image build, which deletes
+// go.work: deps come from go.mod, so this passes once scripts/release-all.sh
+// has bumped them to the released utility versions.
+def inGo(String script) {
+    withEnv(["CI_SCRIPT=${script}"]) {
+        sh '''
+            mkdir -p "$WORKSPACE@tmp/ci-home"
+            docker run --rm -u "$(id -u):$(id -g)" \\
+                -v "$WORKSPACE:$WORKSPACE" -v "$WORKSPACE@tmp:$WORKSPACE@tmp" -w "$WORKSPACE" \\
+                -e HOME="$WORKSPACE@tmp/ci-home" \\
+                -e GOCACHE="$WORKSPACE@tmp/go-build" \\
+                -e GOMODCACHE="$WORKSPACE@tmp/go-mod" \\
+                -e GOTOOLCHAIN=local -e GOWORK=off -e GOPRIVATE='github.com/CodeClarityCE/*' \\
+                golang:1.27.1@sha256:3680233e3204827fbdc66088528ae6d4b3d034f51d03a99d454f6de034888244 \\
+                sh -ec "$CI_SCRIPT"
+        '''
+    }
+}
+
 pipeline {
     agent { label 'codeclarity' }
 
@@ -57,29 +81,10 @@ pipeline {
         }
 
         stage('Test') {
-            // Pinned Go toolchain instead of whatever the agent host has. Keep the
-            // image in sync with .cloud/docker/Dockerfile and go.mod (go 1.27.1).
-            // GOWORK=off matches the image build, which deletes go.work: deps come
-            // from go.mod, so this passes once scripts/release-all.sh has bumped
-            // them to the released utility versions.
-            agent {
-                docker {
-                    image 'golang:1.27.1@sha256:3680233e3204827fbdc66088528ae6d4b3d034f51d03a99d454f6de034888244'
-                    reuseNode true
-                }
-            }
-            environment {
-                HOME = "${env.WORKSPACE}@tmp/ci-home"
-                GOCACHE = "${env.WORKSPACE}@tmp/go-build"
-                GOMODCACHE = "${env.WORKSPACE}@tmp/go-mod"
-                GOTOOLCHAIN = 'local'
-                GOWORK = 'off'
-                GOPRIVATE = 'github.com/CodeClarityCE/*'
-            }
             steps {
-                sh 'go vet ./...'
-                sh 'go test ./...'
-                sh 'go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...'
+                inGo('go vet ./...')
+                inGo('go test ./...')
+                inGo('go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...')
             }
         }
 
