@@ -117,7 +117,7 @@ pipeline {
                     sh 'echo "$DOCKERHUB_CREDENTIALS_PSW" | docker login -u "$DOCKERHUB_CREDENTIALS_USR" --password-stdin'
 
                     // Reuse existing builder or create new one
-                    sh "docker buildx create --name ${Builder} --use --bootstrap 2>/dev/null || docker buildx use ${Builder}"
+                    sh "docker buildx create --name ${env.Builder} --use --bootstrap 2>/dev/null || docker buildx use ${env.Builder}"
 
                     // Build and push first (can be retried without side effects)
                     sh "docker buildx build -f .cloud/docker/Dockerfile --platform linux/amd64,linux/arm64 --target plugin --tag ${ImageName}:latest --tag ${Tag} --push ."
