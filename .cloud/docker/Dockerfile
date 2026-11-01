@@ -5,7 +5,7 @@ ARG USERNAME=codeclarity
 ARG PLUGINNAME=plugin
 
 # DEV IMAGE
-FROM golang:1.25.7-alpine AS plugin-dev
+FROM golang:1.27.3-alpine@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb AS plugin-dev
 ARG KIND
 ARG PLUGINNAME
 WORKDIR /codeclarity/${KIND}/${PLUGINNAME}
@@ -15,7 +15,7 @@ RUN go install github.com/air-verse/air@v1.62.0
 CMD ["air", "-c", ".air.toml"]
 
 # DEBUG IMAGE
-FROM golang:1.25.7-alpine AS plugin-debug
+FROM golang:1.27.3-alpine@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb AS plugin-debug
 ARG KIND
 ARG PLUGINNAME
 ENV KIND=${KIND}
@@ -29,19 +29,29 @@ CMD ["/go/bin/dlv", "debug", ".", "--headless", "--listen=:40000", "--accept-mul
 
 
 # BUILD IMAGE
-FROM golang:1.25.7-alpine AS plugin-build
+FROM golang:1.27.3-alpine@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb AS plugin-build
 ARG KIND
 ARG PLUGINNAME
-COPY . /codeclarity/${KIND}/${PLUGINNAME}
+ARG DIRNAME=
+COPY . /codeclarity_src
+RUN DIR="${DIRNAME:-${PLUGINNAME}}" && \
+    if [ -d "/codeclarity_src/${KIND}/$DIR" ]; then \
+      mv /codeclarity_src /codeclarity; \
+      if [ "$DIR" != "${PLUGINNAME}" ]; then \
+        ln -s "$DIR" "/codeclarity/${KIND}/${PLUGINNAME}"; \
+      fi; \
+    else \
+      mkdir -p /codeclarity/${KIND} && \
+      mv /codeclarity_src /codeclarity/${KIND}/${PLUGINNAME} && \
+      rm -f /codeclarity/${KIND}/${PLUGINNAME}/go.work; \
+    fi
 WORKDIR /codeclarity/${KIND}/${PLUGINNAME}
-ADD .cloud/docker/config/* /root
-RUN rm go.work
 RUN apk update && apk upgrade --no-cache
 RUN apk add git
 RUN [ "go", "build", "-o", "plugin" ]
 
 # PRODUCTION IMAGE
-FROM alpine:3.23.3 AS plugin
+FROM alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 AS plugin
 ARG KIND
 ARG USERNAME
 ARG PLUGINNAME

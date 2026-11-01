@@ -71,6 +71,11 @@ func Dispatcher() {
 	}
 
 	log.Printf("Dispatcher Service started")
+
+	// Start the self-healing reaper: reconciles analyses left non-terminal by
+	// lost/dropped completion messages (idempotent — shares the locked finalizer).
+	go runReaper(service.DB.CodeClarity, service.dependencyResolver, service.ServiceBase)
+
 	service.WaitForever()
 }
 

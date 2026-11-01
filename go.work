@@ -1,8 +1,9 @@
-go 1.25.7
+go 1.27.3
 
-toolchain go1.24.1
+toolchain go1.27.3
 
 use (
+	../../utilities/amqp-helper
 	../../utilities/boilerplates
 	../../utilities/db-helper
 	../../utilities/types
