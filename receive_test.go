@@ -1,6 +1,7 @@
 package main
 
 import (
+	"reflect"
 	"testing"
 	"time"
 
@@ -345,4 +346,41 @@ func TestStageZeroNeedsRedrive(t *testing.T) {
 			t.Fatal("a completed stage 0 must advance, not re-drive")
 		}
 	})
+}
+
+func TestPlannedSteps(t *testing.T) {
+	step := func(names ...string) []codeclarity.Step {
+		out := make([]codeclarity.Step, 0, len(names))
+		for _, name := range names {
+			out = append(out, codeclarity.Step{Name: name})
+		}
+		return out
+	}
+	names := func(stages [][]codeclarity.Step) [][]string {
+		out := [][]string{}
+		for _, stage := range stages {
+			row := []string{}
+			for _, s := range stage {
+				row = append(row, s.Name)
+			}
+			out = append(out, row)
+		}
+		return out
+	}
+	analyzer := [][]codeclarity.Step{step("js-sbom", "php-sbom"), step("vuln-finder", "license-finder")}
+
+	jsOnly := plannedSteps(analyzer, [][]codeclarity.Step{step("js-sbom"), step("vuln-finder", "license-finder")})
+	if got, want := names(jsOnly), [][]string{{"js-sbom"}, {"vuln-finder", "license-finder"}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("js plan = %v, want %v", got, want)
+	}
+
+	if got := plannedSteps(analyzer, nil); len(got) != 2 || len(got[0]) != 2 {
+		t.Errorf("no plan should keep every step, got %v", names(got))
+	}
+
+	// A stage left empty is dropped, so stage indexes stay valid.
+	onlyLater := plannedSteps(analyzer, [][]codeclarity.Step{step("vuln-finder")})
+	if got, want := names(onlyLater), [][]string{{"vuln-finder"}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("later-stage plan = %v, want %v", got, want)
+	}
 }
