@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/CodeClarityCE/utility-boilerplates"
@@ -30,18 +31,52 @@ type pendingMessage struct {
 
 // evaluateStage reports the terminal state of a stage's steps.
 //   - anyFailure is true if any step failed.
-//   - allSuccess is true if every step succeeded (vacuously true for an empty stage).
+//   - allSuccess is true if every step succeeded or was skipped (vacuously true for an empty stage).
 func evaluateStage(steps []codeclarity.Step) (anyFailure bool, allSuccess bool) {
 	allSuccess = true
 	for _, step := range steps {
 		if step.Status == codeclarity.FAILURE {
 			anyFailure = true
 		}
-		if step.Status != codeclarity.SUCCESS {
+		if step.Status != codeclarity.SUCCESS && step.Status != codeclarity.SKIPPED {
 			allSuccess = false
 		}
 	}
 	return anyFailure, allSuccess
+}
+
+// markStageFailed fails the analysis and records why, keeping any earlier reason.
+func markStageFailed(doc *codeclarity.Analysis) {
+	doc.Status = codeclarity.FAILURE
+	if doc.FailureReason == "" {
+		doc.FailureReason = stageFailureReason(doc.Steps)
+	}
+}
+
+// stageFailureReason describes the failed step that finished first.
+func stageFailureReason(stages [][]codeclarity.Step) string {
+	var first *codeclarity.Step
+	var firstEnded time.Time
+	for s := range stages {
+		for i := range stages[s] {
+			candidate := &stages[s][i]
+			if candidate.Status != codeclarity.FAILURE {
+				continue
+			}
+			ended, err := time.Parse(time.RFC3339Nano, candidate.Ended_on)
+			if first == nil || (err == nil && !firstEnded.IsZero() && ended.Before(firstEnded)) {
+				first, firstEnded = candidate, ended
+			}
+		}
+	}
+	if first == nil {
+		return ""
+	}
+	cause, _ := first.Result[codeclarity.StepFailureReasonKey].(string)
+	if cause = codeclarity.SanitizeFailureReason(cause); cause == "" {
+		return codeclarity.SanitizeFailureReason(first.Name + " failed unexpectedly. Try again, and contact your administrator if it keeps failing.")
+	}
+	return codeclarity.SanitizeFailureReason(first.Name + " failed: " + cause)
 }
 
 // reclaimStuckSteps clears later-stage (stage >= 1) STARTED steps whose dispatch
@@ -205,7 +240,7 @@ func finalizeOrAdvanceStage(analysisId uuid.UUID, db *bun.DB, dr *DependencyReso
 		case codeclarity.COMPLETED, codeclarity.FAILURE, codeclarity.CANCELLED:
 			return nil // already terminal
 		case codeclarity.UPDATING_DB:
-			return nil // packageFollower will re-trigger when the DB update completes
+			return nil // packageFollower re-triggers on completion; the reaper recovers it if interrupted
 		}
 		if len(doc.Steps) == 0 {
 			return nil
@@ -222,7 +257,7 @@ func finalizeOrAdvanceStage(analysisId uuid.UUID, db *bun.DB, dr *DependencyReso
 				}
 			}
 			if anyFailure {
-				doc.Status = codeclarity.FAILURE
+				markStageFailed(doc)
 				outcome = "failure"
 			} else {
 				doc.Status = codeclarity.COMPLETED
@@ -248,7 +283,7 @@ func finalizeOrAdvanceStage(analysisId uuid.UUID, db *bun.DB, dr *DependencyReso
 			anyFailure, allSuccess := evaluateStage(doc.Steps[doc.Stage])
 			switch {
 			case anyFailure:
-				doc.Status = codeclarity.FAILURE
+				markStageFailed(doc)
 				outcome = "failure"
 				if _, e := tx.NewUpdate().Model(doc).WherePK().Exec(ctx); e != nil {
 					return e
@@ -324,6 +359,9 @@ func analysisExpired(doc *codeclarity.Analysis, now time.Time, maxAge time.Durat
 	return now.Sub(doc.Created_on) > maxAge
 }
 
+// interruptedAnalysisReason tells the user to resubmit a retired analysis.
+const interruptedAnalysisReason = "This analysis was interrupted before it could finish. Please resubmit it."
+
 // failAnalysis marks a non-terminal analysis FAILURE (status-guarded so it is
 // idempotent and never clobbers an already-terminal row). Used to retire analyses
 // too old to be worth recovering, so the reaper stops re-driving abandoned work.
@@ -332,13 +370,9 @@ func failAnalysis(analysisId uuid.UUID, db *bun.DB) error {
 	_, err := db.NewUpdate().
 		Model((*codeclarity.Analysis)(nil)).
 		Set("status = ?", codeclarity.FAILURE).
+		Set("failure_reason = COALESCE(failure_reason, ?)", interruptedAnalysisReason).
 		Where("id = ?", analysisId).
-		Where("status IN (?)", bun.In([]string{
-			string(codeclarity.STARTED),
-			string(codeclarity.ONGOING),
-			string(codeclarity.REQUESTED),
-			string(codeclarity.TRIGGERED),
-		})).
+		Where("status IN (?)", bun.In(recoverableStatuses)).
 		Exec(ctx)
 	return err
 }
@@ -621,6 +655,10 @@ func dispatchDownloaderResult(d amqp.Delivery, dependencyResolver *DependencyRes
 		log.Printf("[dispatch:downloader_dispatcher] bad message, dropping: %v", err)
 		return
 	}
+	if err := applyLanguageSelection(msg.AnalysisId, msg.DetectedLanguages, service.DB.CodeClarity); err != nil {
+		log.Printf("[dispatch:downloader_dispatcher] language selection failed for %s, dropping (reaper will retry): %v", msg.AnalysisId, err)
+		return
+	}
 	msgs, _, err := finalizeOrAdvanceStage(msg.AnalysisId, service.DB.CodeClarity, dependencyResolver, true, 0, false, nil)
 	if err != nil {
 		log.Printf("[dispatch:downloader_dispatcher] stage-0 start failed for %s, dropping (reaper will retry): %v", msg.AnalysisId, err)
@@ -641,4 +679,110 @@ func dispatchPluginResult(d amqp.Delivery, dependencyResolver *DependencyResolve
 		return
 	}
 	sendMessages(service, msgs)
+}
+
+const noSupportedManifestReason = "no supported manifest was found in this project"
+
+// selectPluginsForLanguages marks steps for other languages as skipped and
+// returns a failure reason when none of the detected languages can be analyzed.
+func selectPluginsForLanguages(steps [][]codeclarity.Step, config map[string]codeclarity.LanguagePlugins, detected []string) string {
+	if len(config) == 0 {
+		return ""
+	}
+
+	planned := map[string]bool{}
+	for _, stage := range steps {
+		for _, step := range stage {
+			planned[step.Name] = true
+		}
+	}
+
+	found := map[string]bool{}
+	for _, language := range detected {
+		found[strings.ToLower(language)] = true
+	}
+
+	languagesUsing := map[string]int{}
+	languagePlugins := map[string]bool{}
+	for _, entry := range config {
+		for _, plugin := range entry.Plugins {
+			languagesUsing[plugin]++
+			languagePlugins[plugin] = true
+		}
+	}
+
+	selected := map[string]bool{}
+	for language, entry := range config {
+		if found[strings.ToLower(language)] && languageRunnable(entry.Plugins, planned, languagesUsing) {
+			for _, plugin := range entry.Plugins {
+				selected[plugin] = true
+			}
+		}
+	}
+	if len(selected) == 0 {
+		return noSupportedManifestReason
+	}
+
+	now := time.Now().Format(time.RFC3339Nano)
+	reason := "does not apply to the detected languages: " + strings.Join(detected, ", ")
+	for s := range steps {
+		for i := range steps[s] {
+			step := &steps[s][i]
+			pending := step.Status == "" || step.Status == codeclarity.REQUESTED
+			if pending && languagePlugins[step.Name] && !selected[step.Name] {
+				step.Status = codeclarity.SKIPPED
+				step.Ended_on = now
+				step.Result = map[string]any{"skip_reason": reason}
+			}
+		}
+	}
+	return ""
+}
+
+// languageRunnable reports whether a language has a planned plugin of its own.
+// Shared plugins alone do not count, or a project could pass with no SBOM.
+func languageRunnable(plugins []string, planned map[string]bool, languagesUsing map[string]int) bool {
+	anyPlanned, hasOwn, ownPlanned := false, false, false
+	for _, plugin := range plugins {
+		anyPlanned = anyPlanned || planned[plugin]
+		if languagesUsing[plugin] == 1 {
+			hasOwn = true
+			ownPlanned = ownPlanned || planned[plugin]
+		}
+	}
+	if hasOwn {
+		return ownPlanned
+	}
+	return anyPlanned
+}
+
+// applyLanguageSelection records the plugins chosen for the downloaded project.
+// The analysis fails when no detected language is supported.
+func applyLanguageSelection(analysisId uuid.UUID, detected []string, db *bun.DB) error {
+	ctx := context.Background()
+	return db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
+		doc := &codeclarity.Analysis{Id: analysisId}
+		if e := tx.NewSelect().Model(doc).WherePK().For("UPDATE").Scan(ctx); e != nil {
+			return fmt.Errorf("lock+reload analysis %s: %w", analysisId, e)
+		}
+		switch doc.Status {
+		case codeclarity.COMPLETED, codeclarity.FAILURE, codeclarity.CANCELLED, codeclarity.UPDATING_DB:
+			return nil
+		}
+		if doc.Stage != 0 {
+			return nil
+		}
+		analyzer := &codeclarity.Analyzer{Id: doc.AnalyzerId}
+		if e := tx.NewSelect().Model(analyzer).WherePK().Scan(ctx); e != nil {
+			return fmt.Errorf("load analyzer %s: %w", doc.AnalyzerId, e)
+		}
+		if reason := selectPluginsForLanguages(doc.Steps, analyzer.LanguageConfig, detected); reason != "" {
+			doc.Status = codeclarity.FAILURE
+			if doc.FailureReason == "" {
+				doc.FailureReason = reason
+			}
+		}
+		_, e := tx.NewUpdate().Model(doc).WherePK().Exec(ctx)
+		return e
+	})
 }
