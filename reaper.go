@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
 	"log"
 	"os"
 	"strconv"
@@ -43,6 +45,15 @@ const (
 	defaultRecoveryMaxAge = 24 * time.Hour
 	envRecoveryMaxAge     = "RECOVERY_MAX_AGE" // seconds
 )
+
+// recoverableStatuses are the statuses the reaper may re-drive or retire.
+var recoverableStatuses = []string{
+	string(codeclarity.ONGOING),
+	string(codeclarity.STARTED),
+	string(codeclarity.REQUESTED),
+	string(codeclarity.TRIGGERED),
+	string(codeclarity.UPDATING_DB),
+}
 
 // envDurationSeconds reads an env var as a positive number of seconds, falling
 // back to def on unset/invalid values.
@@ -92,7 +103,7 @@ func runReaper(db *bun.DB, dr *DependencyResolver, service *boilerplates.Service
 }
 
 // nonTerminalAnalyses returns the ids of every analysis that can be orphaned or
-// stuck: the in-flight states (STARTED/ONGOING) plus the API's pre-dispatch states
+// stuck: the in-flight states (STARTED/ONGOING/UPDATING_DB) plus the API's pre-dispatch states
 // (REQUESTED/TRIGGERED). The latter matter because an analysis is created REQUESTED
 // and only flips to STARTED once the dispatcher consumes its api_request message —
 // if that message is lost (RabbitMQ has no dev volume, so a restart wipes it), the
@@ -109,12 +120,7 @@ func nonTerminalAnalyses(ctx context.Context, db *bun.DB) ([]codeclarity.Analysi
 	err := db.NewSelect().
 		Model(&candidates).
 		Column("id").
-		Where("status IN (?)", bun.In([]string{
-			string(codeclarity.ONGOING),
-			string(codeclarity.STARTED),
-			string(codeclarity.REQUESTED),
-			string(codeclarity.TRIGGERED),
-		})).
+		Where("status IN (?)", bun.In(recoverableStatuses)).
 		Where("(schedule_type IS NULL OR schedule_type = ?)", "once").
 		Scan(ctx)
 	return candidates, err
@@ -191,7 +197,7 @@ func recoverAnalysis(id uuid.UUID, db *bun.DB, dr *DependencyResolver, service *
 		return false
 	}
 	switch doc.Status {
-	case codeclarity.COMPLETED, codeclarity.FAILURE, codeclarity.CANCELLED, codeclarity.UPDATING_DB:
+	case codeclarity.COMPLETED, codeclarity.FAILURE, codeclarity.CANCELLED:
 		return false
 	}
 	if len(doc.Steps) == 0 {
@@ -209,6 +215,21 @@ func recoverAnalysis(id uuid.UUID, db *bun.DB, dr *DependencyResolver, service *
 		return true
 	}
 
+	// An interrupted package update never notifies the dispatcher, so hand the
+	// analysis back to normal recovery. Too soon means it may still be working.
+	resumed := false
+	if doc.Status == codeclarity.UPDATING_DB {
+		var err error
+		if resumed, err = resumeUpdatingDB(id, db, timeout, force); err != nil {
+			log.Printf("[reaper] resume updating_db %s failed: %v", id, err)
+			return false
+		}
+		if !resumed {
+			return false
+		}
+		log.Printf("[reaper] resumed interrupted updating_db analysis %s", id)
+	}
+
 	// Stage 0 not yet complete: a stage-0 plugin that reported FAILURE (its
 	// completion was lost) must be finalized as failure by the finalizer, not
 	// re-run. Otherwise re-drive via the downloader rather than in place, because
@@ -217,7 +238,7 @@ func recoverAnalysis(id uuid.UUID, db *bun.DB, dr *DependencyResolver, service *
 		anyFailure, allSuccess := evaluateStage(doc.Steps[0])
 		if !anyFailure && !allSuccess {
 			if !force && !stageZeroNeedsRedrive(doc, time.Now(), timeout) {
-				return false // fresh submit still downloading — leave it alone
+				return resumed // fresh submit still downloading, leave it alone
 			}
 			// A "stuck" stage-0 analysis whose download queue still holds
 			// messages is almost certainly just waiting its turn behind a deep
@@ -228,12 +249,12 @@ func recoverAnalysis(id uuid.UUID, db *bun.DB, dr *DependencyResolver, service *
 			// The startup pass (force) skips this: the queue is known-empty.
 			if !force {
 				if depth, err := service.QueueDepth("dispatcher_downloader"); err == nil && depth > 0 {
-					return false
+					return resumed
 				}
 			}
 			if err := redriveStageZero(id, db, dr, service); err != nil {
 				log.Printf("[reaper] redrive stage-0 %s failed: %v", id, err)
-				return false
+				return resumed
 			}
 			log.Printf("[reaper] re-drove stage-0 for %s", id)
 			return true
@@ -242,7 +263,57 @@ func recoverAnalysis(id uuid.UUID, db *bun.DB, dr *DependencyResolver, service *
 		// fall through to the finalizer.
 	}
 
-	return reapAnalysis(id, db, dr, service, timeout, force)
+	return reapAnalysis(id, db, dr, service, timeout, force) || resumed
+}
+
+// resumeStuckUpdatingDB moves a stuck updating_db analysis back to ongoing, as the
+// package follower does when it finishes. Returns true if it changed the status.
+func resumeStuckUpdatingDB(doc *codeclarity.Analysis, now time.Time, timeout time.Duration, force bool) bool {
+	if doc.Status != codeclarity.UPDATING_DB {
+		return false
+	}
+	if !force && now.Sub(lastStepActivity(doc)) < timeout {
+		return false
+	}
+	doc.Status = codeclarity.ONGOING
+	return true
+}
+
+// lastStepActivity returns the latest step timestamp, or Created_on if there is none.
+func lastStepActivity(doc *codeclarity.Analysis) time.Time {
+	latest := doc.Created_on
+	for _, stage := range doc.Steps {
+		for _, st := range stage {
+			for _, stamp := range []string{st.Started_on, st.Ended_on} {
+				if t, err := time.Parse(time.RFC3339Nano, stamp); err == nil && t.After(latest) {
+					latest = t
+				}
+			}
+		}
+	}
+	return latest
+}
+
+// resumeUpdatingDB applies resumeStuckUpdatingDB under a row lock and writes only
+// the status, so it cannot overwrite step results.
+func resumeUpdatingDB(id uuid.UUID, db *bun.DB, timeout time.Duration, force bool) (bool, error) {
+	resumed := false
+	err := db.RunInTx(context.Background(), &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
+		doc := &codeclarity.Analysis{Id: id}
+		if e := tx.NewSelect().Model(doc).WherePK().For("UPDATE").Scan(ctx); e != nil {
+			return fmt.Errorf("lock+reload analysis %s: %w", id, e)
+		}
+		if !resumeStuckUpdatingDB(doc, time.Now(), timeout, force) {
+			return nil
+		}
+		resumed = true
+		_, e := tx.NewUpdate().Model(doc).Column("status").WherePK().Exec(ctx)
+		return e
+	})
+	if err != nil {
+		return false, err
+	}
+	return resumed, nil
 }
 
 // reapAnalysis reconciles a single analysis to a fixpoint: it re-runs the

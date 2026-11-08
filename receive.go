@@ -206,7 +206,7 @@ func finalizeOrAdvanceStage(analysisId uuid.UUID, db *bun.DB, dr *DependencyReso
 		case codeclarity.COMPLETED, codeclarity.FAILURE, codeclarity.CANCELLED:
 			return nil // already terminal
 		case codeclarity.UPDATING_DB:
-			return nil // packageFollower will re-trigger when the DB update completes
+			return nil // packageFollower re-triggers on completion; the reaper recovers it if interrupted
 		}
 		if len(doc.Steps) == 0 {
 			return nil
@@ -334,12 +334,7 @@ func failAnalysis(analysisId uuid.UUID, db *bun.DB) error {
 		Model((*codeclarity.Analysis)(nil)).
 		Set("status = ?", codeclarity.FAILURE).
 		Where("id = ?", analysisId).
-		Where("status IN (?)", bun.In([]string{
-			string(codeclarity.STARTED),
-			string(codeclarity.ONGOING),
-			string(codeclarity.REQUESTED),
-			string(codeclarity.TRIGGERED),
-		})).
+		Where("status IN (?)", bun.In(recoverableStatuses)).
 		Exec(ctx)
 	return err
 }
