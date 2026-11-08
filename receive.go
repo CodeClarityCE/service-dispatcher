@@ -702,15 +702,18 @@ func selectPluginsForLanguages(steps [][]codeclarity.Step, config map[string]cod
 		found[strings.ToLower(language)] = true
 	}
 
+	languagesUsing := map[string]int{}
 	languagePlugins := map[string]bool{}
+	for _, entry := range config {
+		for _, plugin := range entry.Plugins {
+			languagesUsing[plugin]++
+			languagePlugins[plugin] = true
+		}
+	}
+
 	selected := map[string]bool{}
 	for language, entry := range config {
-		runnable := found[strings.ToLower(language)]
-		for _, plugin := range entry.Plugins {
-			languagePlugins[plugin] = true
-			runnable = runnable && planned[plugin]
-		}
-		if runnable {
+		if found[strings.ToLower(language)] && languageRunnable(entry.Plugins, planned, languagesUsing) {
 			for _, plugin := range entry.Plugins {
 				selected[plugin] = true
 			}
@@ -734,6 +737,23 @@ func selectPluginsForLanguages(steps [][]codeclarity.Step, config map[string]cod
 		}
 	}
 	return ""
+}
+
+// languageRunnable reports whether a language has a planned plugin of its own.
+// Shared plugins alone do not count, or a project could pass with no SBOM.
+func languageRunnable(plugins []string, planned map[string]bool, languagesUsing map[string]int) bool {
+	anyPlanned, hasOwn, ownPlanned := false, false, false
+	for _, plugin := range plugins {
+		anyPlanned = anyPlanned || planned[plugin]
+		if languagesUsing[plugin] == 1 {
+			hasOwn = true
+			ownPlanned = ownPlanned || planned[plugin]
+		}
+	}
+	if hasOwn {
+		return ownPlanned
+	}
+	return anyPlanned
 }
 
 // applyLanguageSelection records the plugins chosen for the downloaded project.

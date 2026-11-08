@@ -162,3 +162,15 @@ func TestUnfinishedDependencyStillBlocksPlugin(t *testing.T) {
 func pluginDependingOn(name string, deps ...string) plugin_db.Plugin {
 	return plugin_db.Plugin{Name: name, DependsOn: deps}
 }
+
+func TestSelectPluginsCustomAnalyzerWithoutASharedPluginStillRuns(t *testing.T) {
+	steps := [][]codeclarity.Step{{step("js-sbom", "")}, {step("vuln-finder", "")}}
+	if reason := selectPluginsForLanguages(steps, multiLanguageConfig, []string{"javascript"}); reason != "" {
+		t.Fatalf("unexpected failure reason %q", reason)
+	}
+	for name, status := range statuses(steps) {
+		if status != "" {
+			t.Errorf("%s status = %q, want it left to run", name, status)
+		}
+	}
+}
