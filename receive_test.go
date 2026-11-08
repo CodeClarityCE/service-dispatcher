@@ -45,6 +45,24 @@ func TestEvaluateStage(t *testing.T) {
 			wantSuccess: false,
 		},
 		{
+			name:        "skipped steps do not block the stage",
+			steps:       []codeclarity.Step{step("js-sbom", codeclarity.SKIPPED), step("php-sbom", codeclarity.SUCCESS)},
+			wantFailure: false,
+			wantSuccess: true,
+		},
+		{
+			name:        "a selected plugin's failure still fails a stage with skips",
+			steps:       []codeclarity.Step{step("js-sbom", codeclarity.SKIPPED), step("php-sbom", codeclarity.FAILURE)},
+			wantFailure: true,
+			wantSuccess: false,
+		},
+		{
+			name:        "a running plugin still holds a stage with skips",
+			steps:       []codeclarity.Step{step("js-sbom", codeclarity.SKIPPED), step("php-sbom", codeclarity.STARTED)},
+			wantFailure: false,
+			wantSuccess: false,
+		},
+		{
 			name:        "empty stage is vacuously complete",
 			steps:       []codeclarity.Step{},
 			wantFailure: false,

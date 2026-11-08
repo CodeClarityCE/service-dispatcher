@@ -127,13 +127,15 @@ func (dr *DependencyResolver) areDependenciesSatisfied(pluginName string, analys
 }
 
 // filterDependenciesByAnalysis filters the dependency list to only include plugins
-// that are actually present in the current analysis
+// that are present in the current analysis and were not skipped
 func (dr *DependencyResolver) filterDependenciesByAnalysis(dependencies []string, analysis *codeclarity.Analysis) []string {
 	// Build a set of all plugins present in this analysis
 	analysisPlugins := make(map[string]bool)
 	for _, stage := range analysis.Steps {
 		for _, step := range stage {
-			analysisPlugins[step.Name] = true
+			if step.Status != codeclarity.SKIPPED {
+				analysisPlugins[step.Name] = true
+			}
 		}
 	}
 
