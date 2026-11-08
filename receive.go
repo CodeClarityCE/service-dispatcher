@@ -547,7 +547,7 @@ func dispatchAPIRequest(d amqp.Delivery, dependencyResolver *DependencyResolver,
 			return fmt.Errorf("load analyzer: %w", e)
 		}
 		analysisDocument.Stage = 0
-		analysisDocument.Steps = analyzerDocument.Steps
+		analysisDocument.Steps = plannedSteps(analyzerDocument.Steps, analysisDocument.Steps)
 		analysisDocument.Status = codeclarity.STARTED
 		_, e := tx.NewUpdate().Model(analysisDocument).WherePK().Exec(ctx)
 		return e
@@ -585,6 +585,34 @@ func dispatchAPIRequest(d amqp.Delivery, dependencyResolver *DependencyResolver,
 		return
 	}
 	sendMessages(service, msgs)
+}
+
+// plannedSteps keeps the analyzer's steps that the analysis selected, such as by language.
+// An analysis without a plan runs every step.
+func plannedSteps(analyzer, plan [][]codeclarity.Step) [][]codeclarity.Step {
+	selected := map[string]bool{}
+	for _, stage := range plan {
+		for _, step := range stage {
+			selected[step.Name] = true
+		}
+	}
+	if len(selected) == 0 {
+		return analyzer
+	}
+
+	var kept [][]codeclarity.Step
+	for _, stage := range analyzer {
+		var stageSteps []codeclarity.Step
+		for _, step := range stage {
+			if selected[step.Name] {
+				stageSteps = append(stageSteps, step)
+			}
+		}
+		if len(stageSteps) > 0 {
+			kept = append(kept, stageSteps)
+		}
+	}
+	return kept
 }
 
 func dispatchDownloaderResult(d amqp.Delivery, dependencyResolver *DependencyResolver, service *boilerplates.ServiceBase) {
