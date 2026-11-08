@@ -3,13 +3,17 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
+	"maps"
 	"os"
+	"slices"
 	"strconv"
 	"time"
 
 	boilerplates "github.com/CodeClarityCE/utility-boilerplates"
+	types_amqp "github.com/CodeClarityCE/utility-types/amqp"
 	codeclarity "github.com/CodeClarityCE/utility-types/codeclarity_db"
 	"github.com/google/uuid"
 	"github.com/uptrace/bun"
@@ -44,7 +48,18 @@ const (
 	// forever. Must be generously larger than any real end-to-end analysis time.
 	defaultRecoveryMaxAge = 24 * time.Hour
 	envRecoveryMaxAge     = "RECOVERY_MAX_AGE" // seconds
+
+	packageFollowerQueue = "sbom_packageFollower"
+
+	// Config key packageFollower stamps when it starts an update.
+	updatingDBStartedKey = "package_follower_started_on"
+
+	updatingDBResumed      = "resumed"
+	updatingDBImportResent = "import_resent"
 )
+
+// sbomLanguages maps each SBOM plugin to its package follower language.
+var sbomLanguages = map[string]string{"js-sbom": "javascript", "php-sbom": "php"}
 
 // recoverableStatuses are the statuses the reaper may re-drive or retire.
 var recoverableStatuses = []string{
@@ -215,18 +230,23 @@ func recoverAnalysis(id uuid.UUID, db *bun.DB, dr *DependencyResolver, service *
 		return true
 	}
 
-	// An interrupted package update never notifies the dispatcher, so hand the
-	// analysis back to normal recovery. Too soon means it may still be working.
+	// An interrupted package update never notifies the dispatcher. Re-send the import
+	// when its SBOM is stored, otherwise hand back to normal recovery to re-run SBOM.
 	resumed := false
 	if doc.Status == codeclarity.UPDATING_DB {
-		var err error
-		if resumed, err = resumeUpdatingDB(id, db, timeout, force); err != nil {
-			log.Printf("[reaper] resume updating_db %s failed: %v", id, err)
+		outcome, err := recoverUpdatingDB(id, db, service, timeout, force)
+		if err != nil {
+			log.Printf("[reaper] recover updating_db %s failed: %v", id, err)
 			return false
 		}
-		if !resumed {
+		switch outcome {
+		case "":
 			return false
+		case updatingDBImportResent:
+			log.Printf("[reaper] re-sent interrupted package import for %s", id)
+			return true
 		}
+		resumed = true
 		log.Printf("[reaper] resumed interrupted updating_db analysis %s", id)
 	}
 
@@ -269,14 +289,30 @@ func recoverAnalysis(id uuid.UUID, db *bun.DB, dr *DependencyResolver, service *
 // resumeStuckUpdatingDB moves a stuck updating_db analysis back to ongoing, as the
 // package follower does when it finishes. Returns true if it changed the status.
 func resumeStuckUpdatingDB(doc *codeclarity.Analysis, now time.Time, timeout time.Duration, force bool) bool {
-	if doc.Status != codeclarity.UPDATING_DB {
-		return false
-	}
-	if !force && now.Sub(lastStepActivity(doc)) < timeout {
+	if !updatingDBStuck(doc, now, timeout, force) {
 		return false
 	}
 	doc.Status = codeclarity.ONGOING
 	return true
+}
+
+// updatingDBStuck reports whether a package update has run past the stuck threshold.
+func updatingDBStuck(doc *codeclarity.Analysis, now time.Time, timeout time.Duration, force bool) bool {
+	if doc.Status != codeclarity.UPDATING_DB {
+		return false
+	}
+	return force || now.Sub(updatingDBSince(doc)) >= timeout
+}
+
+// updatingDBSince returns when the package update began, or the last step activity
+// for analyses without a recorded start.
+func updatingDBSince(doc *codeclarity.Analysis) time.Time {
+	if started, ok := doc.Config[updatingDBStartedKey].(string); ok {
+		if t, err := time.Parse(time.RFC3339Nano, started); err == nil {
+			return t
+		}
+	}
+	return lastStepActivity(doc)
 }
 
 // lastStepActivity returns the latest step timestamp, or Created_on if there is none.
@@ -294,26 +330,122 @@ func lastStepActivity(doc *codeclarity.Analysis) time.Time {
 	return latest
 }
 
-// resumeUpdatingDB applies resumeStuckUpdatingDB under a row lock and writes only
-// the status, so it cannot overwrite step results.
-func resumeUpdatingDB(id uuid.UUID, db *bun.DB, timeout time.Duration, force bool) (bool, error) {
-	resumed := false
+// recoverUpdatingDB re-sends the package import of a stuck updating_db analysis
+// and keeps it paused until the follower finishes. Without a stored SBOM to import
+// from it resumes the analysis instead. Holds the row lock while it decides.
+func recoverUpdatingDB(id uuid.UUID, db *bun.DB, service *boilerplates.ServiceBase, timeout time.Duration, force bool) (string, error) {
+	outcome := ""
 	err := db.RunInTx(context.Background(), &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
 		doc := &codeclarity.Analysis{Id: id}
 		if e := tx.NewSelect().Model(doc).WherePK().For("UPDATE").Scan(ctx); e != nil {
 			return fmt.Errorf("lock+reload analysis %s: %w", id, e)
 		}
-		if !resumeStuckUpdatingDB(doc, time.Now(), timeout, force) {
+		now := time.Now()
+		if !updatingDBStuck(doc, now, timeout, force) {
 			return nil
 		}
-		resumed = true
-		_, e := tx.NewUpdate().Model(doc).Column("status").WherePK().Exec(ctx)
+		messages, e := packageImportMessages(ctx, tx, doc)
+		if e != nil {
+			return e
+		}
+		if len(messages) == 0 {
+			resumeStuckUpdatingDB(doc, now, timeout, force)
+			outcome = updatingDBResumed
+			_, e = tx.NewUpdate().Model(doc).Column("status").WherePK().Exec(ctx)
+			return e
+		}
+		for _, data := range messages {
+			if e := service.SendMessage(packageFollowerQueue, data); e != nil {
+				return fmt.Errorf("re-send package import for %s: %w", id, e)
+			}
+		}
+		// Restart the stuck clock so the next pass does not send it again at once.
+		if doc.Config == nil {
+			doc.Config = map[string]any{}
+		}
+		doc.Config[updatingDBStartedKey] = now.Format(time.RFC3339Nano)
+		outcome = updatingDBImportResent
+		_, e = tx.NewUpdate().Model(doc).Column("config").WherePK().Exec(ctx)
 		return e
 	})
 	if err != nil {
-		return false, err
+		return "", err
 	}
-	return resumed, nil
+	return outcome, nil
+}
+
+// sbomImport is a stored SBOM whose packages need importing.
+type sbomImport struct {
+	key      uuid.UUID
+	language string
+}
+
+// sbomsToReimport lists the SBOM steps that finished and stored a result.
+func sbomsToReimport(stages [][]codeclarity.Step) []sbomImport {
+	imports := []sbomImport{}
+	for _, stage := range stages {
+		for _, st := range stage {
+			language, isSbom := sbomLanguages[st.Name]
+			if !isSbom || st.Status != codeclarity.SUCCESS {
+				continue
+			}
+			rawKey, _ := st.Result["sbomKey"].(string)
+			key, err := uuid.Parse(rawKey)
+			if err != nil {
+				log.Printf("[reaper] step %s has an unreadable sbomKey %q: %v", st.Name, rawKey, err)
+				continue
+			}
+			imports = append(imports, sbomImport{key, language})
+		}
+	}
+	return imports
+}
+
+// packageNamesFromSbom returns the sorted package names across an SBOM's workspaces.
+func packageNamesFromSbom(raw []byte) ([]string, error) {
+	var parsed struct {
+		Workspaces map[string]struct {
+			Dependencies map[string]json.RawMessage `json:"dependencies"`
+		} `json:"workspaces"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return nil, fmt.Errorf("read sbom: %w", err)
+	}
+	names := map[string]bool{}
+	for _, workspace := range parsed.Workspaces {
+		for name := range workspace.Dependencies {
+			names[name] = true
+		}
+	}
+	return slices.Sorted(maps.Keys(names)), nil
+}
+
+// packageImportMessages builds one follower message per stored SBOM with packages.
+func packageImportMessages(ctx context.Context, tx bun.Tx, doc *codeclarity.Analysis) ([][]byte, error) {
+	messages := [][]byte{}
+	for _, sbom := range sbomsToReimport(doc.Steps) {
+		res := codeclarity.Result{Id: sbom.key}
+		if e := tx.NewSelect().Model(&res).WherePK().Scan(ctx); e != nil {
+			return nil, fmt.Errorf("load sbom %s: %w", sbom.key, e)
+		}
+		raw, ok := res.Result.([]byte)
+		if !ok {
+			return nil, fmt.Errorf("sbom %s is not stored as bytes", sbom.key)
+		}
+		names, e := packageNamesFromSbom(raw)
+		if e != nil {
+			return nil, fmt.Errorf("sbom %s: %w", sbom.key, e)
+		}
+		if len(names) == 0 {
+			continue
+		}
+		data, e := json.Marshal(types_amqp.SbomPackageFollowerMessage{AnalysisId: doc.Id, PackagesNames: names, Language: sbom.language})
+		if e != nil {
+			return nil, e
+		}
+		messages = append(messages, data)
+	}
+	return messages, nil
 }
 
 // reapAnalysis reconciles a single analysis to a fixpoint: it re-runs the

@@ -198,3 +198,62 @@ func TestRetiringAnAnalysisSaysItWasInterrupted(t *testing.T) {
 		t.Errorf("an earlier reason could be overwritten: %s", queries[0])
 	}
 }
+
+func TestUpdatingDBStuckMeasuresFromTheUpdateStart(t *testing.T) {
+	const timeout = 30 * time.Minute
+	now := time.Now()
+	stamp := func(d time.Duration) string { return now.Add(-d).Format(time.RFC3339Nano) }
+	doc := func(started string, lastStep time.Duration) *codeclarity.Analysis {
+		st := step("js-sbom", codeclarity.SUCCESS)
+		st.Ended_on = stamp(lastStep)
+		return &codeclarity.Analysis{
+			Status:     codeclarity.UPDATING_DB,
+			Created_on: now.Add(-2 * time.Hour),
+			Config:     map[string]any{updatingDBStartedKey: started},
+			Steps:      [][]codeclarity.Step{{st}},
+		}
+	}
+
+	if updatingDBStuck(doc(stamp(5*time.Minute), time.Hour), now, timeout, false) {
+		t.Error("an update that began recently must be left alone, whatever the step age")
+	}
+	if !updatingDBStuck(doc(stamp(time.Hour), time.Minute), now, timeout, false) {
+		t.Error("an update that began long ago is stuck, even with recent step activity")
+	}
+	if !updatingDBStuck(doc("not a time", time.Hour), now, timeout, false) {
+		t.Error("an unreadable start falls back to step activity")
+	}
+}
+
+func TestSbomsToReimport(t *testing.T) {
+	jsKey, phpKey := uuid.New(), uuid.New()
+	js := step("js-sbom", codeclarity.SUCCESS)
+	js.Result = map[string]any{"sbomKey": jsKey.String()}
+	php := step("php-sbom", codeclarity.SUCCESS)
+	php.Result = map[string]any{"sbomKey": phpKey.String()}
+	unfinished := step("php-sbom", codeclarity.STARTED)
+	other := step("vuln-finder", codeclarity.SUCCESS)
+
+	got := sbomsToReimport([][]codeclarity.Step{{js, unfinished}, {php, other}})
+	want := []sbomImport{{jsKey, "javascript"}, {phpKey, "php"}}
+	if !slices.Equal(got, want) {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+}
+
+func TestPackageNamesFromSbom(t *testing.T) {
+	raw := []byte(`{"workspaces":{
+		"a":{"dependencies":{"lodash":{"4.0.0":{}},"react":{"18.0.0":{}}}},
+		"b":{"dependencies":{"lodash":{"3.0.0":{}},"vue":{"3.0.0":{}}}}
+	}}`)
+	got, err := packageNamesFromSbom(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"lodash", "react", "vue"}; !slices.Equal(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	if _, err := packageNamesFromSbom([]byte("nope")); err == nil {
+		t.Fatal("a corrupt SBOM must be an error, not an empty import")
+	}
+}
