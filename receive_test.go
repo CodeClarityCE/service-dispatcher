@@ -402,3 +402,68 @@ func TestPlannedSteps(t *testing.T) {
 		t.Errorf("later-stage plan = %v, want %v", got, want)
 	}
 }
+
+func failedStep(name, ended, reason string) codeclarity.Step {
+	s := step(name, codeclarity.FAILURE)
+	s.Ended_on = ended
+	if reason != "" {
+		s.Result = map[string]any{codeclarity.StepFailureReasonKey: reason}
+	}
+	return s
+}
+
+func TestMarkStageFailed(t *testing.T) {
+	cases := []struct {
+		name  string
+		steps [][]codeclarity.Step
+		prior string
+		want  string
+	}{
+		{
+			name:  "names the plugin and its cause",
+			steps: [][]codeclarity.Step{{failedStep("php-sbom", "", "no PHP manifest was found in the project")}},
+			want:  "php-sbom failed: no PHP manifest was found in the project",
+		},
+		{
+			name:  "says the plugin failed when it gave no cause",
+			steps: [][]codeclarity.Step{{failedStep("vuln-finder", "", "")}},
+			want:  "vuln-finder failed unexpectedly. Try again, and contact your administrator if it keeps failing.",
+		},
+		{
+			name: "keeps the failure that finished first",
+			steps: [][]codeclarity.Step{{
+				failedStep("license-finder", "2026-01-01T10:00:05Z", "later error"),
+				failedStep("vuln-finder", "2026-01-01T10:00:01.5Z", "root cause"),
+			}},
+			want: "vuln-finder failed: root cause",
+		},
+		{
+			name:  "keeps a reason already recorded",
+			steps: [][]codeclarity.Step{{failedStep("js-sbom", "", "another cause")}},
+			prior: "the repository could not be downloaded",
+			want:  "the repository could not be downloaded",
+		},
+		{
+			name:  "hides paths a plugin reported",
+			steps: [][]codeclarity.Step{{failedStep("js-sbom", "", "cannot read /private/org/package.json")}},
+			want:  "js-sbom failed: cannot read [path]",
+		},
+		{
+			name:  "ignores a skipped plugin",
+			steps: [][]codeclarity.Step{{step("js-sbom", codeclarity.SKIPPED), failedStep("php-sbom", "", "bad lock file")}},
+			want:  "php-sbom failed: bad lock file",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := &codeclarity.Analysis{Status: codeclarity.ONGOING, Steps: tc.steps, FailureReason: tc.prior}
+			markStageFailed(doc)
+			if doc.Status != codeclarity.FAILURE {
+				t.Errorf("status = %q, want failure", doc.Status)
+			}
+			if doc.FailureReason != tc.want {
+				t.Errorf("reason = %q, want %q", doc.FailureReason, tc.want)
+			}
+		})
+	}
+}

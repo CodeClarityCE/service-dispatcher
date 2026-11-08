@@ -1,12 +1,19 @@
 package main
 
 import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	codeclarity "github.com/CodeClarityCE/utility-types/codeclarity_db"
 	"github.com/google/uuid"
+	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/dialect/pgdialect"
 )
 
 func TestDropSucceededSteps(t *testing.T) {
@@ -152,5 +159,42 @@ func TestRecoverableStatusesIncludeUpdatingDB(t *testing.T) {
 	want := []string{"ongoing", "started", "requested", "triggered", "updating_db"}
 	if !slices.Equal(recoverableStatuses, want) {
 		t.Fatalf("recoverableStatuses = %v, want %v", recoverableStatuses, want)
+	}
+}
+
+// recordingConnector captures each statement so writes can be checked without a database.
+type recordingConnector struct{ queries *[]string }
+
+func (c recordingConnector) Connect(context.Context) (driver.Conn, error) {
+	return recordingConn(c), nil
+}
+func (recordingConnector) Driver() driver.Driver { return nil }
+
+type recordingConn struct{ queries *[]string }
+
+func (recordingConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("not supported") }
+func (recordingConn) Close() error                        { return nil }
+func (recordingConn) Begin() (driver.Tx, error)           { return nil, errors.New("not supported") }
+func (c recordingConn) ExecContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
+	*c.queries = append(*c.queries, query)
+	return driver.RowsAffected(1), nil
+}
+
+func TestRetiringAnAnalysisSaysItWasInterrupted(t *testing.T) {
+	var queries []string
+	db := bun.NewDB(sql.OpenDB(recordingConnector{&queries}), pgdialect.New())
+	defer db.Close()
+
+	if err := failAnalysis(uuid.New(), db); err != nil {
+		t.Fatal(err)
+	}
+	if len(queries) != 1 {
+		t.Fatalf("expected one write, got %v", queries)
+	}
+	if !strings.Contains(queries[0], "interrupted") || !strings.Contains(queries[0], "resubmit") {
+		t.Errorf("reason does not say the analysis was interrupted: %s", queries[0])
+	}
+	if !strings.Contains(queries[0], "COALESCE(failure_reason") {
+		t.Errorf("an earlier reason could be overwritten: %s", queries[0])
 	}
 }

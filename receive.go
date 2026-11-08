@@ -45,6 +45,40 @@ func evaluateStage(steps []codeclarity.Step) (anyFailure bool, allSuccess bool) 
 	return anyFailure, allSuccess
 }
 
+// markStageFailed fails the analysis and records why, keeping any earlier reason.
+func markStageFailed(doc *codeclarity.Analysis) {
+	doc.Status = codeclarity.FAILURE
+	if doc.FailureReason == "" {
+		doc.FailureReason = stageFailureReason(doc.Steps)
+	}
+}
+
+// stageFailureReason describes the failed step that finished first.
+func stageFailureReason(stages [][]codeclarity.Step) string {
+	var first *codeclarity.Step
+	var firstEnded time.Time
+	for s := range stages {
+		for i := range stages[s] {
+			candidate := &stages[s][i]
+			if candidate.Status != codeclarity.FAILURE {
+				continue
+			}
+			ended, err := time.Parse(time.RFC3339Nano, candidate.Ended_on)
+			if first == nil || (err == nil && !firstEnded.IsZero() && ended.Before(firstEnded)) {
+				first, firstEnded = candidate, ended
+			}
+		}
+	}
+	if first == nil {
+		return ""
+	}
+	cause, _ := first.Result[codeclarity.StepFailureReasonKey].(string)
+	if cause = codeclarity.SanitizeFailureReason(cause); cause == "" {
+		return codeclarity.SanitizeFailureReason(first.Name + " failed unexpectedly. Try again, and contact your administrator if it keeps failing.")
+	}
+	return codeclarity.SanitizeFailureReason(first.Name + " failed: " + cause)
+}
+
 // reclaimStuckSteps clears later-stage (stage >= 1) STARTED steps whose dispatch
 // is assumed lost — those STARTED for longer than reclaimAfter (publish failure or
 // a dead plugin), or every STARTED step regardless of age when force is set (a
@@ -223,7 +257,7 @@ func finalizeOrAdvanceStage(analysisId uuid.UUID, db *bun.DB, dr *DependencyReso
 				}
 			}
 			if anyFailure {
-				doc.Status = codeclarity.FAILURE
+				markStageFailed(doc)
 				outcome = "failure"
 			} else {
 				doc.Status = codeclarity.COMPLETED
@@ -249,7 +283,7 @@ func finalizeOrAdvanceStage(analysisId uuid.UUID, db *bun.DB, dr *DependencyReso
 			anyFailure, allSuccess := evaluateStage(doc.Steps[doc.Stage])
 			switch {
 			case anyFailure:
-				doc.Status = codeclarity.FAILURE
+				markStageFailed(doc)
 				outcome = "failure"
 				if _, e := tx.NewUpdate().Model(doc).WherePK().Exec(ctx); e != nil {
 					return e
@@ -325,6 +359,9 @@ func analysisExpired(doc *codeclarity.Analysis, now time.Time, maxAge time.Durat
 	return now.Sub(doc.Created_on) > maxAge
 }
 
+// interruptedAnalysisReason tells the user to resubmit a retired analysis.
+const interruptedAnalysisReason = "This analysis was interrupted before it could finish. Please resubmit it."
+
 // failAnalysis marks a non-terminal analysis FAILURE (status-guarded so it is
 // idempotent and never clobbers an already-terminal row). Used to retire analyses
 // too old to be worth recovering, so the reaper stops re-driving abandoned work.
@@ -333,6 +370,7 @@ func failAnalysis(analysisId uuid.UUID, db *bun.DB) error {
 	_, err := db.NewUpdate().
 		Model((*codeclarity.Analysis)(nil)).
 		Set("status = ?", codeclarity.FAILURE).
+		Set("failure_reason = COALESCE(failure_reason, ?)", interruptedAnalysisReason).
 		Where("id = ?", analysisId).
 		Where("status IN (?)", bun.In(recoverableStatuses)).
 		Exec(ctx)
