@@ -1,6 +1,6 @@
 module github.com/CodeClarityCE/service-dispatcher
 
-go 1.27.3
+go 1.27.4
 
 require (
 	github.com/CodeClarityCE/utility-boilerplates v0.0.8-alpha
