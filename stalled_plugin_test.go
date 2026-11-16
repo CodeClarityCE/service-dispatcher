@@ -8,6 +8,7 @@ import (
 
 	codeclarity "github.com/CodeClarityCE/utility-types/codeclarity_db"
 	"github.com/google/uuid"
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 const testGrace = 3 * time.Minute
@@ -98,6 +99,9 @@ func TestFailStalledSteps(t *testing.T) {
 		if !strings.Contains(doc.FailureReason, "vuln-finder") {
 			t.Fatalf("failure reason %q does not name the plugin", doc.FailureReason)
 		}
+		if want := stageFailureReason(doc.Steps); doc.FailureReason != want {
+			t.Fatalf("failure reason %q, want the normal step failure reason %q", doc.FailureReason, want)
+		}
 		if got := doc.Steps[1][0].Status; got != codeclarity.FAILURE {
 			t.Fatalf("step status = %s, want failure", got)
 		}
@@ -132,6 +136,51 @@ func TestFailStalledSteps(t *testing.T) {
 			t.Fatal("failed a step whose plugin was never probed")
 		}
 	})
+}
+
+func TestHasStalledStep(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	doc := &codeclarity.Analysis{Steps: [][]codeclarity.Step{{startedStep("vuln-finder", t0)}}}
+
+	w := newPluginWatch()
+	w.observe("vuln-finder", 0, t0)
+	if hasStalledStep(doc, w, t0.Add(time.Minute), testGrace) {
+		t.Fatal("reported a stalled step inside the grace period")
+	}
+	if !hasStalledStep(doc, w, t0.Add(testGrace), testGrace) {
+		t.Fatal("missed a step whose plugin is past the grace period")
+	}
+}
+
+func TestMemoizeProbe(t *testing.T) {
+	calls := map[string]int{}
+	probe := memoizeProbe(func(plugin string) (int, error) {
+		calls[plugin]++
+		return 0, errors.New("amqp down")
+	})
+	for range 3 {
+		_, _ = probe("vuln-finder")
+		_, _ = probe("js-sbom")
+	}
+	if calls["vuln-finder"] != 1 || calls["js-sbom"] != 1 {
+		t.Fatalf("probe calls = %v, want one per plugin", calls)
+	}
+}
+
+func TestAMQPConsumerProbeDialsOnce(t *testing.T) {
+	dials := 0
+	p := &amqpConsumerProbe{dial: func(string) (*amqp.Connection, error) {
+		dials++
+		return nil, errors.New("connection refused")
+	}}
+	for _, plugin := range []string{"vuln-finder", "js-sbom", "license-finder"} {
+		if _, err := p.consumers(plugin); err == nil {
+			t.Fatalf("probe of %s succeeded with no broker", plugin)
+		}
+	}
+	if dials != 1 {
+		t.Fatalf("dialed %d times in one pass, want 1", dials)
+	}
 }
 
 func TestObserveStartedPlugins(t *testing.T) {

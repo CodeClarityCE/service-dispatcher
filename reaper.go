@@ -189,9 +189,10 @@ func reapOnce(db *bun.DB, dr *DependencyResolver, service *boilerplates.ServiceB
 	grace := stalledPluginGrace()
 	probe := newAMQPConsumerProbe(service)
 	defer probe.close()
+	consumers := memoizeProbe(probe.consumers)
 	healed := 0
 	for _, c := range candidates {
-		if checkStalledPlugins(c.Id, db, probe.consumers, watch, now, grace) {
+		if checkStalledPlugins(c.Id, db, consumers, watch, now, grace) {
 			healed++
 			continue
 		}
