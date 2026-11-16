@@ -110,10 +110,11 @@ func runReaper(db *bun.DB, dr *DependencyResolver, service *boilerplates.Service
 
 	recoverOnStartup(db, dr, service)
 
+	watch := newPluginWatch()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for range ticker.C {
-		reapOnce(db, dr, service)
+		reapOnce(db, dr, service, watch)
 	}
 }
 
@@ -170,7 +171,8 @@ func recoverOnStartup(db *bun.DB, dr *DependencyResolver, service *boilerplates.
 // reapOnce finds every non-terminal analysis and reconciles each on the interval.
 // The finalizer takes a row lock, so a reaper pass that races a live completion is
 // safe — one wins the lock and transitions, the other no-ops.
-func reapOnce(db *bun.DB, dr *DependencyResolver, service *boilerplates.ServiceBase) {
+func reapOnce(db *bun.DB, dr *DependencyResolver, service *boilerplates.ServiceBase, watch *pluginWatch) {
+	defer watch.endPass()
 	ctx := context.Background()
 	candidates, err := nonTerminalAnalyses(ctx, db)
 	if err != nil {
@@ -183,8 +185,16 @@ func reapOnce(db *bun.DB, dr *DependencyResolver, service *boilerplates.ServiceB
 
 	timeout := stepStuckTimeout()
 	maxAge := recoveryMaxAge()
+	now := time.Now()
+	grace := stalledPluginGrace()
+	probe := newAMQPConsumerProbe(service)
+	defer probe.close()
 	healed := 0
 	for _, c := range candidates {
+		if checkStalledPlugins(c.Id, db, probe.consumers, watch, now, grace) {
+			healed++
+			continue
+		}
 		if recoverAnalysis(c.Id, db, dr, service, timeout, maxAge, false) {
 			healed++
 		}
