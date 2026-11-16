@@ -1,6 +1,6 @@
 {
     "name": "dispatcher",
-    "version": "v0.0.21-alpha",
+    "version": "v0.0.22-alpha",
     "image_name": "codeclarityce/service-dispatcher",
     "depends_on": []
 }
