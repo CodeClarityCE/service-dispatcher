@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	codeclarity "github.com/CodeClarityCE/utility-types/codeclarity_db"
 	"github.com/google/uuid"
 	amqp "github.com/rabbitmq/amqp091-go"
+	"github.com/sirupsen/logrus"
 	"github.com/uptrace/bun"
 )
 
@@ -232,7 +234,7 @@ func finalizeOrAdvanceStage(analysisId uuid.UUID, db *bun.DB, dr *DependencyReso
 	err := db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
 		doc := &codeclarity.Analysis{Id: analysisId}
 		if e := tx.NewSelect().Model(doc).WherePK().For("UPDATE").Scan(ctx); e != nil {
-			return fmt.Errorf("lock+reload analysis %s: %w", analysisId, e)
+			return reloadAnalysisError(analysisId, e)
 		}
 
 		// Idempotency / transient guards.
@@ -423,7 +425,7 @@ func redriveStageZero(analysisId uuid.UUID, db *bun.DB, dr *DependencyResolver, 
 	err := db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
 		doc := &codeclarity.Analysis{Id: analysisId}
 		if e := tx.NewSelect().Model(doc).WherePK().For("UPDATE").Scan(ctx); e != nil {
-			return fmt.Errorf("lock+reload analysis %s: %w", analysisId, e)
+			return reloadAnalysisError(analysisId, e)
 		}
 		switch doc.Status {
 		case codeclarity.COMPLETED, codeclarity.FAILURE, codeclarity.CANCELLED, codeclarity.UPDATING_DB:
@@ -488,6 +490,35 @@ func redriveStageZero(analysisId uuid.UUID, db *bun.DB, dr *DependencyResolver, 
 	}
 	sendMessages(service, msgs)
 	return nil
+}
+
+// dispatchLog writes the dispatcher's structured lines as JSON.
+var dispatchLog = &logrus.Logger{
+	Out:       logrus.StandardLogger().Out,
+	Formatter: &logrus.JSONFormatter{},
+	Hooks:     make(logrus.LevelHooks),
+	Level:     logrus.InfoLevel,
+}
+
+// errAnalysisGone marks a message whose analysis row no longer exists, usually because it was deleted.
+var errAnalysisGone = errors.New("analysis no longer exists")
+
+// reloadAnalysisError wraps a failed analysis load, marking a missing row with errAnalysisGone.
+func reloadAnalysisError(analysisId uuid.UUID, err error) error {
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("lock+reload analysis %s: %w: %w", analysisId, errAnalysisGone, err)
+	}
+	return fmt.Errorf("lock+reload analysis %s: %w", analysisId, err)
+}
+
+// logDropped logs a dropped message: at info when its analysis is gone, else as a retryable failure.
+func logDropped(queue string, analysisId uuid.UUID, err error, what string) {
+	if errors.Is(err, errAnalysisGone) {
+		dispatchLog.WithFields(logrus.Fields{"analysisId": analysisId.String(), "queue": queue}).
+			Info("Dropping message: the analysis no longer exists, it was probably deleted")
+		return
+	}
+	log.Printf("[dispatch:%s] %s for %s, dropping (reaper will retry): %v", queue, what, analysisId, err)
 }
 
 // dispatch routes an incoming message based on its source queue.
@@ -574,7 +605,7 @@ func dispatchAPIRequest(d amqp.Delivery, dependencyResolver *DependencyResolver,
 	analysisDocument := &codeclarity.Analysis{Id: analysisId}
 	err = db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
 		if e := tx.NewSelect().Model(analysisDocument).WherePK().For("UPDATE").Scan(ctx); e != nil {
-			return fmt.Errorf("load analysis: %w", e)
+			return reloadAnalysisError(analysisId, e)
 		}
 		analyzerDocument := &codeclarity.Analyzer{Id: analysisDocument.AnalyzerId}
 		if e := tx.NewSelect().Model(analyzerDocument).WherePK().Scan(ctx); e != nil {
@@ -587,7 +618,7 @@ func dispatchAPIRequest(d amqp.Delivery, dependencyResolver *DependencyResolver,
 		return e
 	})
 	if err != nil {
-		log.Printf("[dispatch:api_request] init failed for %s, dropping: %v", analysisId, err)
+		logDropped("api_request", analysisId, err, "init failed")
 		return
 	}
 
@@ -656,12 +687,12 @@ func dispatchDownloaderResult(d amqp.Delivery, dependencyResolver *DependencyRes
 		return
 	}
 	if err := applyLanguageSelection(msg.AnalysisId, msg.DetectedLanguages, service.DB.CodeClarity); err != nil {
-		log.Printf("[dispatch:downloader_dispatcher] language selection failed for %s, dropping (reaper will retry): %v", msg.AnalysisId, err)
+		logDropped("downloader_dispatcher", msg.AnalysisId, err, "language selection failed")
 		return
 	}
 	msgs, _, err := finalizeOrAdvanceStage(msg.AnalysisId, service.DB.CodeClarity, dependencyResolver, true, 0, false, nil)
 	if err != nil {
-		log.Printf("[dispatch:downloader_dispatcher] stage-0 start failed for %s, dropping (reaper will retry): %v", msg.AnalysisId, err)
+		logDropped("downloader_dispatcher", msg.AnalysisId, err, "stage-0 start failed")
 		return
 	}
 	sendMessages(service, msgs)
@@ -675,7 +706,7 @@ func dispatchPluginResult(d amqp.Delivery, dependencyResolver *DependencyResolve
 	}
 	msgs, _, err := finalizeOrAdvanceStage(msg.AnalysisId, service.DB.CodeClarity, dependencyResolver, true, 0, false, nil)
 	if err != nil {
-		log.Printf("[dispatch:plugins_dispatcher] finalize failed for %s, dropping (reaper will retry): %v", msg.AnalysisId, err)
+		logDropped("plugins_dispatcher", msg.AnalysisId, err, "finalize failed")
 		return
 	}
 	sendMessages(service, msgs)
@@ -763,7 +794,7 @@ func applyLanguageSelection(analysisId uuid.UUID, detected []string, db *bun.DB)
 	return db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
 		doc := &codeclarity.Analysis{Id: analysisId}
 		if e := tx.NewSelect().Model(doc).WherePK().For("UPDATE").Scan(ctx); e != nil {
-			return fmt.Errorf("lock+reload analysis %s: %w", analysisId, e)
+			return reloadAnalysisError(analysisId, e)
 		}
 		switch doc.Status {
 		case codeclarity.COMPLETED, codeclarity.FAILURE, codeclarity.CANCELLED, codeclarity.UPDATING_DB:
