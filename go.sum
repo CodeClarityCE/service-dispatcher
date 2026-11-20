@@ -1,9 +1,9 @@
-github.com/CodeClarityCE/utility-amqp-helper v0.0.19-alpha h1:vUdizEELDImgj52V60DHZS6GhcFIIRMxEdmmaMXDYN0=
-github.com/CodeClarityCE/utility-amqp-helper v0.0.19-alpha/go.mod h1:5vemGQcAukUWN1oM2EZx0m2NipDBGh+v1tM1rm9Qkd8=
-github.com/CodeClarityCE/utility-boilerplates v0.0.15-alpha h1:HFCYAGlgN9XyzeUJKPKzZyVkYj/bnjrha+HO0u+naC0=
-github.com/CodeClarityCE/utility-boilerplates v0.0.15-alpha/go.mod h1:4v8kqBx/gwstTK1OH/RbY1pBL6XrGM2+66I6tFubi5Y=
-github.com/CodeClarityCE/utility-dbhelper v0.0.22-alpha h1:wBaZa/vHIx7NAHuqZTahXLddVrL32Y+W6MWzVOtKynw=
-github.com/CodeClarityCE/utility-dbhelper v0.0.22-alpha/go.mod h1:C9xSyYfxQlZ4ws2Nbh27EjRv8yAeJRB1CsuD1ObAs0Q=
+github.com/CodeClarityCE/utility-amqp-helper v0.0.20-alpha h1:RYaUpia6qpYXRJf8hvD3eshETWtScwZaTYLISRtsMYA=
+github.com/CodeClarityCE/utility-amqp-helper v0.0.20-alpha/go.mod h1:06WAnryqvdj6rmHhS+JUIAl5LT5lq9MgVJCrPAFuu/E=
+github.com/CodeClarityCE/utility-boilerplates v0.0.16-alpha h1:E7QXxp7lCPIuXPvh3unFyQx5+RgwapIuZwwUfAlJvQw=
+github.com/CodeClarityCE/utility-boilerplates v0.0.16-alpha/go.mod h1:wFVi6dmW9/4nSCIvfIJDP1Plk9hvtwY/oAcJkUY2GY8=
+github.com/CodeClarityCE/utility-dbhelper v0.0.23-alpha h1:oRtk0BnPuM2ob2iWlSILISbCJdq7YITj2G4awVemIuM=
+github.com/CodeClarityCE/utility-dbhelper v0.0.23-alpha/go.mod h1:dOs+HiUAoKYl17Y0oc0SlYw2uo4Jo6GMzKEEDhrnOHs=
 github.com/CodeClarityCE/utility-types v0.0.26-alpha h1:yBb4g6EwZU2qcLLOSqo7Byq4lYOy6viPPQMnJr/DFPM=
 github.com/CodeClarityCE/utility-types v0.0.26-alpha/go.mod h1:sK7bxNhjC0FcXItepuja6qFzv2AmnVo3QlRg0Ve9unc=
 github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
