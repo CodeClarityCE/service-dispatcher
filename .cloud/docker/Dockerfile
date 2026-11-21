@@ -21,7 +21,7 @@ ARG PLUGINNAME
 ENV KIND=${KIND}
 ENV PLUGINNAME=${PLUGINNAME}
 RUN apk add git
-RUN go install github.com/go-delve/delve/cmd/dlv@latest
+RUN go install github.com/go-delve/delve/cmd/dlv@v1.27.2
 ADD .cloud/docker/config/* /root
 WORKDIR /codeclarity/${KIND}/${PLUGINNAME}
 CMD ["/go/bin/dlv", "debug", ".", "--headless", "--listen=:40000", "--accept-multiclient"]
