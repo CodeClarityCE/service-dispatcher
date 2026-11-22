@@ -36,7 +36,9 @@ func SendMessage(queue_name string, data []byte) error {
 	}
 
 	// Purge queue to test our message only
-	ch.QueuePurge(queue_name, true)
+	if _, err := ch.QueuePurge(queue_name, true); err != nil {
+		return err
+	}
 
 	// Send message
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

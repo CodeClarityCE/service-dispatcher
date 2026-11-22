@@ -271,14 +271,10 @@ func finalizeOrAdvanceStage(analysisId uuid.UUID, db *bun.DB, dr *DependencyReso
 			return nil
 		}
 
-		dirty := false
-
 		// Reaper-only: reclaim later-stage STARTED steps whose dispatch was lost so
 		// the dispatch loop re-sends them. Stage 0 is recovered separately by
 		// redriveStageZero (js-sbom needs the source on disk), so it is skipped here.
-		if reclaimStuckSteps(doc, time.Now(), reclaimAfter, forceReclaim, pluginBusy) {
-			dirty = true
-		}
+		dirty := reclaimStuckSteps(doc, time.Now(), reclaimAfter, forceReclaim, pluginBusy)
 
 		// Evaluate the current stage from the locked snapshot.
 		if doc.Stage >= 0 && doc.Stage < len(doc.Steps) {
@@ -374,7 +370,7 @@ func failAnalysis(analysisId uuid.UUID, db *bun.DB) error {
 		Set("status = ?", codeclarity.FAILURE).
 		Set("failure_reason = COALESCE(failure_reason, ?)", interruptedAnalysisReason).
 		Where("id = ?", analysisId).
-		Where("status IN (?)", bun.In(recoverableStatuses)).
+		Where("status IN (?)", bun.List(recoverableStatuses)).
 		Exec(ctx)
 	return err
 }
@@ -756,9 +752,9 @@ func selectPluginsForLanguages(steps [][]codeclarity.Step, config map[string]cod
 
 	now := time.Now().Format(time.RFC3339Nano)
 	reason := "does not apply to the detected languages: " + strings.Join(detected, ", ")
-	for s := range steps {
-		for i := range steps[s] {
-			step := &steps[s][i]
+	for _, stage := range steps {
+		for i := range stage {
+			step := &stage[i]
 			pending := step.Status == "" || step.Status == codeclarity.REQUESTED
 			if pending && languagePlugins[step.Name] && !selected[step.Name] {
 				step.Status = codeclarity.SKIPPED
