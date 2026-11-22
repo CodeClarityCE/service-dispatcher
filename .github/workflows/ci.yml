@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   go:
-    uses: CodeClarityCE/.github/.github/workflows/go-image.yml@v1
+    uses: CodeClarityCE/.github/.github/workflows/go-image.yml@spec/312-beta
     # Write scopes are for the release jobs only; they run on main when CI_RELEASE is true.
     permissions:
       contents: write
