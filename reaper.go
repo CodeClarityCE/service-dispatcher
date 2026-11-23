@@ -16,6 +16,7 @@ import (
 	types_amqp "github.com/CodeClarityCE/utility-types/amqp"
 	codeclarity "github.com/CodeClarityCE/utility-types/codeclarity_db"
 	"github.com/google/uuid"
+	"github.com/sirupsen/logrus"
 	"github.com/uptrace/bun"
 )
 
@@ -77,7 +78,7 @@ func envDurationSeconds(name string, def time.Duration) time.Duration {
 		if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
 			return time.Duration(secs) * time.Second
 		}
-		log.Printf("[reaper] invalid %s=%q, using default %s", name, v, def)
+		logrus.WithFields(logrus.Fields{"name": name, "value": v, "default": def.String()}).Warn("[reaper] invalid env value, using the default")
 	}
 	return def
 }
@@ -136,7 +137,7 @@ func nonTerminalAnalyses(ctx context.Context, db *bun.DB) ([]codeclarity.Analysi
 	err := db.NewSelect().
 		Model(&candidates).
 		Column("id").
-		Where("status IN (?)", bun.In(recoverableStatuses)).
+		Where("status IN (?)", bun.List(recoverableStatuses)).
 		Where("(schedule_type IS NULL OR schedule_type = ?)", "once").
 		Scan(ctx)
 	return candidates, err
