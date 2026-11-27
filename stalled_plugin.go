@@ -26,12 +26,19 @@ var stalledLog = &logrus.Logger{
 // stalledPluginReason is the step failure reason when its plugin has no consumer.
 const stalledPluginReason = "the plugin is not running. Try again shortly, or contact your administrator if it keeps failing."
 
+// stalledFollowerReason is the analysis failure reason when it waits on a package follower with no consumer.
+const stalledFollowerReason = "The package import could not run: the package follower is not running. Try again shortly, or contact your administrator if it keeps failing."
+
 // A step waiting on a plugin with no consumer is failed after a grace period,
 // which lets a restarting plugin reconnect.
 const (
 	defaultStalledPluginGrace = 3 * time.Minute
 	envStalledPluginGrace     = "STALLED_PLUGIN_GRACE" // seconds
 )
+
+// packageFollowerName is the watch and probe name of the package follower, whose
+// queue is sbom_packageFollower rather than a dispatcher_<plugin> queue.
+const packageFollowerName = "packageFollower"
 
 // consumerProbe returns how many consumers are attached to a plugin's dispatch queue.
 type consumerProbe func(plugin string) (int, error)
@@ -75,27 +82,41 @@ func (w *pluginWatch) endPass() {
 	w.seen = map[string]bool{}
 }
 
-// observeStartedPlugins probes each plugin that has a STARTED step in doc. A failed
-// probe records nothing, so an AMQP outage never counts as a missing consumer.
+// observeStartedPlugins probes each plugin with a STARTED step, and the follower while doc waits on it.
+// A failed probe records nothing, so an AMQP outage never counts as a missing consumer.
 func observeStartedPlugins(doc *codeclarity.Analysis, probe consumerProbe, w *pluginWatch, now time.Time) {
+	var names []string
 	for _, stage := range doc.Steps {
 		for _, st := range stage {
-			if st.Status != codeclarity.STARTED {
-				continue
+			if st.Status == codeclarity.STARTED {
+				names = append(names, st.Name)
 			}
-			consumers, err := probe(st.Name)
-			if err != nil {
-				stalledLog.WithFields(logrus.Fields{"analysisId": doc.Id.String(), "plugin": st.Name, "error": err.Error()}).
-					Warn("Could not count plugin consumers")
-				continue
-			}
-			w.observe(st.Name, consumers, now)
 		}
+	}
+	if awaitingPackageImport(doc) {
+		names = append(names, packageFollowerName)
+	}
+	for _, name := range names {
+		consumers, err := probe(name)
+		if err != nil {
+			stalledLog.WithFields(logrus.Fields{"analysisId": doc.Id.String(), "plugin": name, "error": err.Error()}).
+				Warn("Could not count plugin consumers")
+			continue
+		}
+		w.observe(name, consumers, now)
 	}
 }
 
-// hasStalledStep reports whether any STARTED step of doc waits on a stalled plugin.
-func hasStalledStep(doc *codeclarity.Analysis, w *pluginWatch, now time.Time, grace time.Duration) bool {
+// followerStalled reports whether doc waits on a package follower that has had no consumer for grace.
+func followerStalled(doc *codeclarity.Analysis, w *pluginWatch, now time.Time, grace time.Duration) bool {
+	return awaitingPackageImport(doc) && w.stalled(packageFollowerName, now, grace)
+}
+
+// hasStalledWait reports whether a STARTED step or the package import wait of doc waits on a stalled consumer.
+func hasStalledWait(doc *codeclarity.Analysis, w *pluginWatch, now time.Time, grace time.Duration) bool {
+	if followerStalled(doc, w, now, grace) {
+		return true
+	}
 	for _, stage := range doc.Steps {
 		for _, st := range stage {
 			if st.Status == codeclarity.STARTED && w.stalled(st.Name, now, grace) {
@@ -133,8 +154,18 @@ func failStalledSteps(doc *codeclarity.Analysis, w *pluginWatch, now time.Time, 
 	}
 	if failed {
 		markStageFailed(doc)
+		return true
 	}
-	return failed
+	if followerStalled(doc, w, now, grace) {
+		doc.Status = codeclarity.FAILURE
+		if doc.FailureReason == "" {
+			doc.FailureReason = stalledFollowerReason
+		}
+		stalledLog.WithFields(logrus.Fields{"analysisId": doc.Id.String(), "plugin": packageFollowerName, "grace": grace.String()}).
+			Warn("Failing analysis: it waits on a package follower with no consumer")
+		return true
+	}
+	return false
 }
 
 // failStalledPluginSteps locks the analysis, re-checks it and fails it when a step
@@ -166,7 +197,7 @@ func checkStalledPlugins(id uuid.UUID, db *bun.DB, probe consumerProbe, w *plugi
 		return false
 	}
 	observeStartedPlugins(doc, probe, w, now)
-	if !hasStalledStep(doc, w, now, grace) {
+	if !hasStalledWait(doc, w, now, grace) {
 		return false
 	}
 	failed, err := failStalledPluginSteps(id, db, w, now, grace)
@@ -228,13 +259,17 @@ func (p *amqpConsumerProbe) consumers(plugin string) (int, error) {
 		return 0, fmt.Errorf("open channel: %w", err)
 	}
 	defer ch.Close()
-	q, err := ch.QueueDeclarePassive("dispatcher_"+plugin, true, false, false, false, nil)
+	queue := "dispatcher_" + plugin
+	if plugin == packageFollowerName {
+		queue = packageFollowerQueue
+	}
+	q, err := ch.QueueDeclarePassive(queue, true, false, false, false, nil)
 	if err != nil {
 		var amqpErr *amqp.Error
 		if errors.As(err, &amqpErr) && amqpErr.Code == amqp.NotFound {
 			return 0, nil
 		}
-		return 0, fmt.Errorf("passive declare of dispatcher_%s: %w", plugin, err)
+		return 0, fmt.Errorf("passive declare of %s: %w", queue, err)
 	}
 	return q.Consumers, nil
 }
