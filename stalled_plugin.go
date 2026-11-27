@@ -29,6 +29,9 @@ const stalledPluginReason = "the plugin is not running. Try again shortly, or co
 // stalledFollowerReason is the analysis failure reason when it waits on a package follower with no consumer.
 const stalledFollowerReason = "The package import could not run: the package follower is not running. Try again shortly, or contact your administrator if it keeps failing."
 
+// unrecordedImportReason is the analysis failure reason when the package follower never records a re-sent import.
+const unrecordedImportReason = "The package import did not finish: the package follower was sent it several times but never recorded it. Try again shortly, or contact your administrator if it keeps failing."
+
 // A step waiting on a plugin with no consumer is failed after a grace period,
 // which lets a restarting plugin reconnect.
 const (
