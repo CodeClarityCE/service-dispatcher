@@ -7,6 +7,7 @@ import (
 
 	codeclarity "github.com/CodeClarityCE/utility-types/codeclarity_db"
 	plugin_db "github.com/CodeClarityCE/utility-types/plugin_db"
+	"github.com/sirupsen/logrus"
 	"github.com/uptrace/bun"
 )
 
@@ -105,6 +106,12 @@ func (dr *DependencyResolver) areDependenciesSatisfied(pluginName string, analys
 					if step.Status != codeclarity.SUCCESS {
 						log.Printf("Dependency %s is not completed (status: %s) for plugin %s",
 							dependency, step.Status, pluginName)
+						return false
+					}
+					// An SBOM only counts once the follower has imported its packages.
+					if !packageImportDone(analysis, dependency) {
+						dispatchLog.WithFields(logrus.Fields{"analysisId": analysis.Id.String(), "plugin": pluginName, "dependency": dependency}).
+							Info("Waiting for the package follower to import the SBOM's packages")
 						return false
 					}
 					log.Printf("Dependency %s is satisfied for plugin %s", dependency, pluginName)

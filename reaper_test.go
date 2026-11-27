@@ -199,7 +199,7 @@ func TestRetiringAnAnalysisSaysItWasInterrupted(t *testing.T) {
 	}
 }
 
-func TestUpdatingDBStuckMeasuresFromTheUpdateStart(t *testing.T) {
+func TestPackageImportStuckMeasuresFromTheUpdateStart(t *testing.T) {
 	const timeout = 30 * time.Minute
 	now := time.Now()
 	stamp := func(d time.Duration) string { return now.Add(-d).Format(time.RFC3339Nano) }
@@ -214,13 +214,13 @@ func TestUpdatingDBStuckMeasuresFromTheUpdateStart(t *testing.T) {
 		}
 	}
 
-	if updatingDBStuck(doc(stamp(5*time.Minute), time.Hour), now, timeout, false) {
+	if packageImportStuck(doc(stamp(5*time.Minute), time.Hour), now, timeout, false) {
 		t.Error("an update that began recently must be left alone, whatever the step age")
 	}
-	if !updatingDBStuck(doc(stamp(time.Hour), time.Minute), now, timeout, false) {
+	if !packageImportStuck(doc(stamp(time.Hour), time.Minute), now, timeout, false) {
 		t.Error("an update that began long ago is stuck, even with recent step activity")
 	}
-	if !updatingDBStuck(doc("not a time", time.Hour), now, timeout, false) {
+	if !packageImportStuck(doc("not a time", time.Hour), now, timeout, false) {
 		t.Error("an unreadable start falls back to step activity")
 	}
 }
@@ -234,10 +234,16 @@ func TestSbomsToReimport(t *testing.T) {
 	unfinished := step("php-sbom", codeclarity.STARTED)
 	other := step("vuln-finder", codeclarity.SUCCESS)
 
-	got := sbomsToReimport([][]codeclarity.Step{{js, unfinished}, {php, other}})
+	doc := &codeclarity.Analysis{Steps: [][]codeclarity.Step{{js, unfinished}, {php, other}}}
+	got := sbomsToReimport(doc)
 	want := []sbomImport{{jsKey, "javascript"}, {phpKey, "php"}}
 	if !slices.Equal(got, want) {
 		t.Fatalf("got %+v, want %+v", got, want)
+	}
+
+	doc.Config = map[string]any{packageImportDoneKey: map[string]any{"javascript": "done"}}
+	if got := sbomsToReimport(doc); !slices.Equal(got, []sbomImport{{phpKey, "php"}}) {
+		t.Fatalf("got %+v, want only the SBOM still waiting for its import", got)
 	}
 }
 

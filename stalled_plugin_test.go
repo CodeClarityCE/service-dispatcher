@@ -138,16 +138,16 @@ func TestFailStalledSteps(t *testing.T) {
 	})
 }
 
-func TestHasStalledStep(t *testing.T) {
+func TestHasStalledWait(t *testing.T) {
 	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 	doc := &codeclarity.Analysis{Steps: [][]codeclarity.Step{{startedStep("vuln-finder", t0)}}}
 
 	w := newPluginWatch()
 	w.observe("vuln-finder", 0, t0)
-	if hasStalledStep(doc, w, t0.Add(time.Minute), testGrace) {
+	if hasStalledWait(doc, w, t0.Add(time.Minute), testGrace) {
 		t.Fatal("reported a stalled step inside the grace period")
 	}
-	if !hasStalledStep(doc, w, t0.Add(testGrace), testGrace) {
+	if !hasStalledWait(doc, w, t0.Add(testGrace), testGrace) {
 		t.Fatal("missed a step whose plugin is past the grace period")
 	}
 }
@@ -186,7 +186,8 @@ func TestAMQPConsumerProbeDialsOnce(t *testing.T) {
 func TestObserveStartedPlugins(t *testing.T) {
 	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 	doc := &codeclarity.Analysis{
-		Id: uuid.New(),
+		Id:     uuid.New(),
+		Config: map[string]any{packageImportDoneKey: map[string]any{"javascript": "done"}},
 		Steps: [][]codeclarity.Step{
 			{step("js-sbom", codeclarity.SUCCESS)},
 			{startedStep("vuln-finder", t0), step("license-finder", codeclarity.SUCCESS)},

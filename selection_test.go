@@ -136,7 +136,7 @@ func TestSelectPluginsDoesNotTouchStepsAlreadyRun(t *testing.T) {
 func TestSkippedDependencyDoesNotBlockPlugin(t *testing.T) {
 	dr := CreateDependencyResolver()
 	dr.pluginConfigs["vuln-finder"] = pluginDependingOn("vuln-finder", "js-sbom", "php-sbom")
-	analysis := &codeclarity.Analysis{Stage: 1, Steps: [][]codeclarity.Step{
+	analysis := &codeclarity.Analysis{Stage: 1, Config: map[string]any{packageImportDoneKey: map[string]any{"php": "done"}}, Steps: [][]codeclarity.Step{
 		{step("js-sbom", codeclarity.SKIPPED), step("php-sbom", codeclarity.SUCCESS)},
 		{step("vuln-finder", "")},
 	}}
