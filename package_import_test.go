@@ -244,7 +244,7 @@ func TestLostFollowerMessageIsResentAndTheFindersThenRun(t *testing.T) {
 
 	// The dispatcher restarts: the follower's message was lost with the queue.
 	var sent []sentMessage
-	outcome, err := recoverPackageImport(id, db, recordSends(t, &sent), 30*time.Minute, true)
+	outcome, err := recoverPackageImport(id, db, recordSends(t, &sent), 30*time.Minute, true, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -269,17 +269,17 @@ func TestIntervalRecoveryWaitsForTheStuckThreshold(t *testing.T) {
 	advancedPastSbom(t, db, dr, id)
 
 	var sent []sentMessage
-	outcome, err := recoverPackageImport(id, db, recordSends(t, &sent), 30*time.Minute, false)
+	outcome, err := recoverPackageImport(id, db, recordSends(t, &sent), 30*time.Minute, false, 3)
 	if err != nil || outcome != "" || len(sent) != 0 {
 		t.Fatalf("outcome = %q, sent = %+v, err = %v; want a fresh wait left alone", outcome, sent, err)
 	}
 
 	// Past the threshold the interval pass re-sends it, then waits a full threshold again.
-	outcome, err = recoverPackageImport(id, db, recordSends(t, &sent), time.Nanosecond, false)
+	outcome, err = recoverPackageImport(id, db, recordSends(t, &sent), time.Nanosecond, false, 3)
 	if err != nil || outcome != updatingDBImportResent || len(sent) != 1 {
 		t.Fatalf("outcome = %q, sent = %+v, err = %v; want the import sent again", outcome, sent, err)
 	}
-	outcome, _ = recoverPackageImport(id, db, recordSends(t, &sent), 30*time.Minute, false)
+	outcome, _ = recoverPackageImport(id, db, recordSends(t, &sent), 30*time.Minute, false, 3)
 	if outcome != "" || len(sent) != 1 {
 		t.Fatalf("outcome = %q, sent = %d; want no second send inside the threshold", outcome, len(sent))
 	}
@@ -359,7 +359,7 @@ func TestSbomWithoutPackagesNeedsNoImport(t *testing.T) {
 	advancedPastSbom(t, db, dr, id)
 
 	var sent []sentMessage
-	outcome, err := recoverPackageImport(id, db, recordSends(t, &sent), 30*time.Minute, true)
+	outcome, err := recoverPackageImport(id, db, recordSends(t, &sent), 30*time.Minute, true, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -367,4 +367,64 @@ func TestSbomWithoutPackagesNeedsNoImport(t *testing.T) {
 		t.Fatalf("outcome = %q, sent = %+v; want the wait ended without an import", outcome, sent)
 	}
 	assertFindersDispatched(t, db, dr, id)
+}
+
+func TestAFollowerThatNeverRecordsTheImportFailsTheAnalysisAfterTheResendLimit(t *testing.T) {
+	db := analysisTables(t)
+	dr := defaultAnalyzerResolver()
+	id := sbomDoneAnalysis(t, db, codeclarity.ONGOING)
+	storeSbom(t, db, id, "lodash")
+	advancedPastSbom(t, db, dr, id)
+
+	// The interval pass finds the wait stuck each time, and the follower never records the import.
+	var sent []sentMessage
+	for range 3 {
+		outcome, err := recoverPackageImport(id, db, recordSends(t, &sent), time.Nanosecond, false, 3)
+		if err != nil || outcome != updatingDBImportResent {
+			t.Fatalf("outcome = %q, err = %v; want the import sent again", outcome, err)
+		}
+	}
+	outcome, err := recoverPackageImport(id, db, recordSends(t, &sent), time.Nanosecond, false, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outcome != updatingDBImportGaveUp || len(sent) != 3 {
+		t.Fatalf("outcome = %q, sent = %d; want the analysis failed after 3 sends", outcome, len(sent))
+	}
+	doc := loadAnalysis(t, db, id)
+	if doc.Status != codeclarity.FAILURE || !strings.Contains(doc.FailureReason, "package follower") {
+		t.Fatalf("status = %q, reason = %q; want a failure naming the package follower", doc.Status, doc.FailureReason)
+	}
+}
+
+func TestStartupResendsDoNotUseUpTheResendLimit(t *testing.T) {
+	db := analysisTables(t)
+	dr := defaultAnalyzerResolver()
+	id := sbomDoneAnalysis(t, db, codeclarity.ONGOING)
+	storeSbom(t, db, id, "lodash")
+	advancedPastSbom(t, db, dr, id)
+
+	// The queue is empty after each restart, so a startup send replaces a lost message.
+	var sent []sentMessage
+	for range 5 {
+		outcome, err := recoverPackageImport(id, db, recordSends(t, &sent), 30*time.Minute, true, 1)
+		if err != nil || outcome != updatingDBImportResent {
+			t.Fatalf("outcome = %q, err = %v; want the import sent again on every restart", outcome, err)
+		}
+	}
+	if doc := loadAnalysis(t, db, id); doc.Status == codeclarity.FAILURE {
+		t.Fatal("restarts alone failed the analysis")
+	}
+}
+
+func TestTheResendLimitDefaultsToThreeAndReadsItsEnvVar(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  int
+	}{{"", 3}, {"5", 5}, {"0", 3}, {"many", 3}} {
+		t.Setenv(envImportResendLimit, tc.value)
+		if got := importResendLimit(); got != tc.want {
+			t.Errorf("%s=%q: got %d, want %d", envImportResendLimit, tc.value, got, tc.want)
+		}
+	}
 }
