@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"maps"
@@ -55,8 +56,16 @@ const (
 	// Config key packageFollower stamps when it starts an update.
 	updatingDBStartedKey = "package_follower_started_on"
 
+	// Config key counting the interval passes that re-sent the package import.
+	packageImportResendsKey = "package_import_resends"
+
+	// Interval re-sends of the package import before the analysis is failed.
+	defaultImportResendLimit = 3
+	envImportResendLimit     = "REAPER_IMPORT_RESENDS"
+
 	updatingDBResumed      = "resumed"
 	updatingDBImportResent = "import_resent"
+	updatingDBImportGaveUp = "import_gave_up"
 )
 
 // sbomLanguages maps each SBOM plugin to its package follower language.
@@ -74,13 +83,25 @@ var recoverableStatuses = []string{
 // envDurationSeconds reads an env var as a positive number of seconds, falling
 // back to def on unset/invalid values.
 func envDurationSeconds(name string, def time.Duration) time.Duration {
+	return time.Duration(envPositiveInt(name, int(def/time.Second))) * time.Second
+}
+
+// envPositiveInt reads an env var as a positive integer, falling back to def on
+// unset/invalid values.
+func envPositiveInt(name string, def int) int {
 	if v := os.Getenv(name); v != "" {
-		if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
-			return time.Duration(secs) * time.Second
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
 		}
-		logrus.WithFields(logrus.Fields{"name": name, "value": v, "default": def.String()}).Warn("[reaper] invalid env value, using the default")
+		logrus.WithFields(logrus.Fields{"name": name, "value": v, "default": def}).Warn("[reaper] invalid env value, using the default")
 	}
 	return def
+}
+
+// importResendLimit returns how often the package import is re-sent before the
+// analysis fails, overridable via REAPER_IMPORT_RESENDS.
+func importResendLimit() int {
+	return envPositiveInt(envImportResendLimit, defaultImportResendLimit)
 }
 
 // reaperInterval returns the reconcile interval, overridable via REAPER_INTERVAL.
@@ -242,24 +263,33 @@ func recoverAnalysis(id uuid.UUID, db *bun.DB, dr *DependencyResolver, service *
 		return true
 	}
 
-	// An interrupted package update never notifies the dispatcher. Re-send the import
-	// when its SBOM is stored, otherwise hand back to normal recovery to re-run SBOM.
+	// A lost package import never notifies the dispatcher, so re-send it from the stored SBOM.
+	// With nothing to import, end the wait and carry on with normal recovery.
 	resumed := false
-	if doc.Status == codeclarity.UPDATING_DB {
-		outcome, err := recoverUpdatingDB(id, db, service, timeout, force)
+	if awaitingPackageImport(doc) {
+		limit := importResendLimit()
+		outcome, err := recoverPackageImport(id, db, service.SendMessage, timeout, force, limit)
 		if err != nil {
-			log.Printf("[reaper] recover updating_db %s failed: %v", id, err)
+			dispatchLog.WithFields(logrus.Fields{"analysisId": id.String(), "error": err.Error()}).Error("[reaper] Could not recover the package import")
 			return false
 		}
 		switch outcome {
 		case "":
-			return false
+			// Still within the threshold. Only updating_db blocks the finalizer.
+			if doc.Status == codeclarity.UPDATING_DB {
+				return false
+			}
 		case updatingDBImportResent:
 			log.Printf("[reaper] re-sent interrupted package import for %s", id)
 			return true
+		case updatingDBImportGaveUp:
+			dispatchLog.WithFields(logrus.Fields{"analysisId": id.String(), "plugin": packageFollowerName, "resends": limit}).
+				Warn("[reaper] Failed analysis: the package follower never recorded the re-sent package import")
+			return true
+		default:
+			resumed = true
+			dispatchLog.WithField("analysisId", id.String()).Info("[reaper] Ended the package import wait: nothing left to import")
 		}
-		resumed = true
-		log.Printf("[reaper] resumed interrupted updating_db analysis %s", id)
 	}
 
 	// Stage 0 not yet complete: a stage-0 plugin that reported FAILURE (its
@@ -301,16 +331,16 @@ func recoverAnalysis(id uuid.UUID, db *bun.DB, dr *DependencyResolver, service *
 // resumeStuckUpdatingDB moves a stuck updating_db analysis back to ongoing, as the
 // package follower does when it finishes. Returns true if it changed the status.
 func resumeStuckUpdatingDB(doc *codeclarity.Analysis, now time.Time, timeout time.Duration, force bool) bool {
-	if !updatingDBStuck(doc, now, timeout, force) {
+	if doc.Status != codeclarity.UPDATING_DB || !packageImportStuck(doc, now, timeout, force) {
 		return false
 	}
 	doc.Status = codeclarity.ONGOING
 	return true
 }
 
-// updatingDBStuck reports whether a package update has run past the stuck threshold.
-func updatingDBStuck(doc *codeclarity.Analysis, now time.Time, timeout time.Duration, force bool) bool {
-	if doc.Status != codeclarity.UPDATING_DB {
+// packageImportStuck reports whether a package import has been awaited past the stuck threshold.
+func packageImportStuck(doc *codeclarity.Analysis, now time.Time, timeout time.Duration, force bool) bool {
+	if !awaitingPackageImport(doc) {
 		return false
 	}
 	return force || now.Sub(updatingDBSince(doc)) >= timeout
@@ -342,10 +372,10 @@ func lastStepActivity(doc *codeclarity.Analysis) time.Time {
 	return latest
 }
 
-// recoverUpdatingDB re-sends the package import of a stuck updating_db analysis
-// and keeps it paused until the follower finishes. Without a stored SBOM to import
-// from it resumes the analysis instead. Holds the row lock while it decides.
-func recoverUpdatingDB(id uuid.UUID, db *bun.DB, service *boilerplates.ServiceBase, timeout time.Duration, force bool) (string, error) {
+// recoverPackageImport re-sends the package imports a stuck analysis waits for, under the row lock.
+// An SBOM with nothing to import is marked done, and with none left updating_db resumes.
+// After maxResends re-sends without the import being recorded, the analysis fails.
+func recoverPackageImport(id uuid.UUID, db *bun.DB, send func(queue string, data []byte) error, timeout time.Duration, force bool, maxResends int) (string, error) {
 	outcome := ""
 	err := db.RunInTx(context.Background(), &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
 		doc := &codeclarity.Analysis{Id: id}
@@ -353,21 +383,38 @@ func recoverUpdatingDB(id uuid.UUID, db *bun.DB, service *boilerplates.ServiceBa
 			return fmt.Errorf("lock+reload analysis %s: %w", id, e)
 		}
 		now := time.Now()
-		if !updatingDBStuck(doc, now, timeout, force) {
+		if !packageImportStuck(doc, now, timeout, force) {
 			return nil
 		}
-		messages, e := packageImportMessages(ctx, tx, doc)
+		messages, nothingToImport, e := packageImportMessages(ctx, tx, doc)
 		if e != nil {
 			return e
+		}
+		for _, language := range nothingToImport {
+			markPackageImportDone(doc, language, now)
 		}
 		if len(messages) == 0 {
 			resumeStuckUpdatingDB(doc, now, timeout, force)
 			outcome = updatingDBResumed
-			_, e = tx.NewUpdate().Model(doc).Column("status").WherePK().Exec(ctx)
+			_, e = tx.NewUpdate().Model(doc).Column("status", "config").WherePK().Exec(ctx)
 			return e
 		}
+		// Only interval re-sends count: on startup the queue is empty, so the message was lost, not ignored.
+		resends := packageImportResends(doc)
+		if !force && resends >= maxResends {
+			doc.Status = codeclarity.FAILURE
+			if doc.FailureReason == "" {
+				doc.FailureReason = unrecordedImportReason
+			}
+			outcome = updatingDBImportGaveUp
+			_, e = tx.NewUpdate().Model(doc).WherePK().Exec(ctx)
+			return e
+		}
+		if !force {
+			resends++
+		}
 		for _, data := range messages {
-			if e := service.SendMessage(packageFollowerQueue, data); e != nil {
+			if e := send(packageFollowerQueue, data); e != nil {
 				return fmt.Errorf("re-send package import for %s: %w", id, e)
 			}
 		}
@@ -376,6 +423,7 @@ func recoverUpdatingDB(id uuid.UUID, db *bun.DB, service *boilerplates.ServiceBa
 			doc.Config = map[string]any{}
 		}
 		doc.Config[updatingDBStartedKey] = now.Format(time.RFC3339Nano)
+		doc.Config[packageImportResendsKey] = resends
 		outcome = updatingDBImportResent
 		_, e = tx.NewUpdate().Model(doc).Column("config").WherePK().Exec(ctx)
 		return e
@@ -386,26 +434,34 @@ func recoverUpdatingDB(id uuid.UUID, db *bun.DB, service *boilerplates.ServiceBa
 	return outcome, nil
 }
 
+// packageImportResends returns how often the reaper has re-sent the package import.
+func packageImportResends(doc *codeclarity.Analysis) int {
+	// Config is JSON, so the count reads back as a float64.
+	count, _ := doc.Config[packageImportResendsKey].(float64)
+	return int(count)
+}
+
 // sbomImport is a stored SBOM whose packages need importing.
 type sbomImport struct {
 	key      uuid.UUID
 	language string
 }
 
-// sbomsToReimport lists the SBOM steps that finished and stored a result.
-func sbomsToReimport(stages [][]codeclarity.Step) []sbomImport {
+// sbomsToReimport lists the SBOM steps that finished but whose packages are not
+// imported yet. An unreadable result key is listed as uuid.Nil.
+func sbomsToReimport(doc *codeclarity.Analysis) []sbomImport {
 	imports := []sbomImport{}
-	for _, stage := range stages {
+	for _, stage := range doc.Steps {
 		for _, st := range stage {
 			language, isSbom := sbomLanguages[st.Name]
-			if !isSbom || st.Status != codeclarity.SUCCESS {
+			if !isSbom || st.Status != codeclarity.SUCCESS || packageImportDone(doc, st.Name) {
 				continue
 			}
 			rawKey, _ := st.Result["sbomKey"].(string)
 			key, err := uuid.Parse(rawKey)
 			if err != nil {
 				log.Printf("[reaper] step %s has an unreadable sbomKey %q: %v", st.Name, rawKey, err)
-				continue
+				key = uuid.Nil
 			}
 			imports = append(imports, sbomImport{key, language})
 		}
@@ -432,32 +488,54 @@ func packageNamesFromSbom(raw []byte) ([]string, error) {
 	return slices.Sorted(maps.Keys(names)), nil
 }
 
-// packageImportMessages builds one follower message per stored SBOM with packages.
-func packageImportMessages(ctx context.Context, tx bun.Tx, doc *codeclarity.Analysis) ([][]byte, error) {
+// packageImportMessages builds one follower message per awaited SBOM with packages.
+// It also returns the languages with nothing to import (no packages, or a missing or unreadable SBOM).
+func packageImportMessages(ctx context.Context, tx bun.Tx, doc *codeclarity.Analysis) ([][]byte, []string, error) {
 	messages := [][]byte{}
-	for _, sbom := range sbomsToReimport(doc.Steps) {
-		res := codeclarity.Result{Id: sbom.key}
-		if e := tx.NewSelect().Model(&res).WherePK().Scan(ctx); e != nil {
-			return nil, fmt.Errorf("load sbom %s: %w", sbom.key, e)
-		}
-		raw, ok := res.Result.([]byte)
-		if !ok {
-			return nil, fmt.Errorf("sbom %s is not stored as bytes", sbom.key)
-		}
-		names, e := packageNamesFromSbom(raw)
+	var nothingToImport []string
+	for _, sbom := range sbomsToReimport(doc) {
+		names, e := storedPackageNames(ctx, tx, sbom.key)
 		if e != nil {
-			return nil, fmt.Errorf("sbom %s: %w", sbom.key, e)
+			return nil, nil, e
 		}
 		if len(names) == 0 {
+			nothingToImport = append(nothingToImport, sbom.language)
 			continue
 		}
 		data, e := json.Marshal(types_amqp.SbomPackageFollowerMessage{AnalysisId: doc.Id, PackagesNames: names, Language: sbom.language})
 		if e != nil {
-			return nil, e
+			return nil, nil, e
 		}
 		messages = append(messages, data)
 	}
-	return messages, nil
+	return messages, nothingToImport, nil
+}
+
+// storedPackageNames reads a stored SBOM's package names; a missing or unreadable one has none.
+// Only a failed query is an error, so the next pass retries it.
+func storedPackageNames(ctx context.Context, tx bun.Tx, key uuid.UUID) ([]string, error) {
+	if key == uuid.Nil {
+		return nil, nil
+	}
+	res := codeclarity.Result{Id: key}
+	if e := tx.NewSelect().Model(&res).WherePK().Scan(ctx); e != nil {
+		if errors.Is(e, sql.ErrNoRows) {
+			dispatchLog.WithField("sbomKey", key.String()).Warn("[reaper] SBOM is missing, nothing to import")
+			return nil, nil
+		}
+		return nil, fmt.Errorf("load sbom %s: %w", key, e)
+	}
+	raw, ok := res.Result.([]byte)
+	if !ok {
+		dispatchLog.WithField("sbomKey", key.String()).Warn("[reaper] SBOM is not stored as bytes, nothing to import")
+		return nil, nil
+	}
+	names, e := packageNamesFromSbom(raw)
+	if e != nil {
+		dispatchLog.WithFields(logrus.Fields{"sbomKey": key.String(), "error": e.Error()}).Warn("[reaper] SBOM is unreadable, nothing to import")
+		return nil, nil
+	}
+	return names, nil
 }
 
 // reapAnalysis reconciles a single analysis to a fixpoint: it re-runs the

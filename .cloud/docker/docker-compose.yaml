@@ -24,6 +24,9 @@ services:
       # Seconds (4h). Literal value: `environment:` ${VAR} interpolation reads
       # the host shell, not the service's env_file.
       - REAPER_STEP_TIMEOUT=14400
+      # Other reaper settings keep their defaults: REAPER_INTERVAL,
+      # REAPER_IMPORT_RESENDS, RECOVERY_MAX_AGE, STALLED_PLUGIN_GRACE
+      # (docs/restart-recovery.md in codeclarity-dev).
 
 volumes:
   projects:
